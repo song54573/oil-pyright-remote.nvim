@@ -1,0 +1,52 @@
+*oil_pyright_remote.txt*    For Neovim >= 0.8.0    Last change: 2025 Nov 24
+
+==============================================================================
+Table of Contents                         *oil_pyright_remote-table-of-contents*
+
+1. oil-pyright-remote.nvim                      |oil_pyright_remote|
+  - Quickstart                      |oil_pyright_remote-quickstart|
+  - Commands                          |oil_pyright_remote-commands|
+  - Configuration                    |oil_pyright_remote-config|
+  - CI & Development           |oil_pyright_remote-ci-development|
+
+==============================================================================
+1. oil-pyright-remote.nvim                            *oil_pyright_remote*
+
+Run `pyright-langserver` over SSH and map all LSP interactions back to files
+opened as `oil-ssh://…`. Handles host/env/root state, validates or installs
+pyright remotely, adapts diagnostics/jumps for oil paths, and auto-reconnects.
+
+Quickstart                                  *oil_pyright_remote-quickstart*
+
+> lazy.nvim example:
+>
+>   {
+>     "song54573/oil-pyright-remote.nvim",
+>     lazy = false,
+>   }
+>
+The entry file `plugin/oil_pyright_remote.lua` requires `oil_pyright_remote`, so Python
+buffers trigger startup automatically.
+
+Commands                                     *oil_pyright_remote-commands*
+
+- :PyrightRemoteHost [host]      set/show SSH host (completes from ~/.ssh/config)
+- :PyrightRemoteEnv [env_dir]    set/show virtualenv root; remembers history
+- :PyrightRemoteRoot [path]      pin workspace root (remote path)
+- :PyrightRemoteRestart          restart the oil_pyright_remote client
+- :PyrightRemoteEnvForget [env]  drop one/all remembered envs
+
+Configuration                                *oil_pyright_remote-config*
+
+Globals (or env vars):
+- g:pyright_remote_host / PYRIGHT_REMOTE_HOST
+- g:pyright_remote_env / PYRIGHT_REMOTE_ENV
+- g:pyright_remote_workspace_root / PYRIGHT_REMOTE_ROOT
+- g:pyright_remote_auto_install   install pyright if missing (default: false)
+- g:pyright_remote_start_notify   notify on start/reconnect (default: false)
+
+Notes
+- Works best with oil.nvim for `oil-ssh://` buffers.
+- Requires SSH access and a Python virtualenv on the remote host; pyright is installed on demand if missing.
+
+vim:tw=78:ts=8:noet:ft=help:norl:
