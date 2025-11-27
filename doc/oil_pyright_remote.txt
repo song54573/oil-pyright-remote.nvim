@@ -1,52 +1,85 @@
-*oil_pyright_remote.txt*    For Neovim >= 0.8.0    Last change: 2025 Nov 24
+*oil_pyright_remote.txt*   For Neovim >= 0.8.0   Last change: 2025 November 27
 
 ==============================================================================
-Table of Contents                         *oil_pyright_remote-table-of-contents*
+Table of Contents                       *oil_pyright_remote-table-of-contents*
 
-1. oil-pyright-remote.nvim                      |oil_pyright_remote|
-  - Quickstart                      |oil_pyright_remote-quickstart|
-  - Commands                          |oil_pyright_remote-commands|
-  - Configuration                    |oil_pyright_remote-config|
-  - CI & Development           |oil_pyright_remote-ci-development|
+1. oil-pyright-remote.nvim        |oil_pyright_remote-oil-pyright-remote.nvim|
+  - Requirements     |oil_pyright_remote-oil-pyright-remote.nvim-requirements|
+  - Installation (lazy.nvim)|oil_pyright_remote-oil-pyright-remote.nvim-installation-(lazy.nvim)|
+  - Commands             |oil_pyright_remote-oil-pyright-remote.nvim-commands|
+  - Configuration (globals or environment)|oil_pyright_remote-oil-pyright-remote.nvim-configuration-(globals-or-environment)|
 
 ==============================================================================
-1. oil-pyright-remote.nvim                            *oil_pyright_remote*
+1. oil-pyright-remote.nvim        *oil_pyright_remote-oil-pyright-remote.nvim*
 
-Run `pyright-langserver` over SSH and map all LSP interactions back to files
-opened as `oil-ssh://…`. Handles host/env/root state, validates or installs
-pyright remotely, adapts diagnostics/jumps for oil paths, and auto-reconnects.
+Run `pyright-langserver` over SSH and make every LSP interaction work on files
+opened via `oil-ssh://…`. Tracks remote hosts/virtualenvs/workspace roots,
+verifies or installs pyright remotely, adapts diagnostics and jumps to oil
+paths, and auto-reconnects.
 
-Quickstart                                  *oil_pyright_remote-quickstart*
 
-> lazy.nvim example:
->
->   {
->     "song54573/oil-pyright-remote.nvim",
->     lazy = false,
->   }
->
-The entry file `plugin/oil_pyright_remote.lua` requires `oil_pyright_remote`, so Python
-buffers trigger startup automatically.
+REQUIREMENTS         *oil_pyright_remote-oil-pyright-remote.nvim-requirements*
 
-Commands                                     *oil_pyright_remote-commands*
+- Neovim 0.8+
+- SSH access to the target host
+- Remote Python virtualenv (pyright will be installed on demand if missing)
+- Optional: oil.nvim for `oil-ssh://` buffers
 
-- :PyrightRemoteHost [host]      set/show SSH host (completes from ~/.ssh/config)
-- :PyrightRemoteEnv [env_dir]    set/show virtualenv root; remembers history
-- :PyrightRemoteRoot [path]      pin workspace root (remote path)
-- :PyrightRemoteRestart          restart the oil_pyright_remote client
-- :PyrightRemoteEnvForget [env]  drop one/all remembered envs
 
-Configuration                                *oil_pyright_remote-config*
+INSTALLATION (LAZY.NVIM)*oil_pyright_remote-oil-pyright-remote.nvim-installation-(lazy.nvim)*
 
-Globals (or env vars):
-- g:pyright_remote_host / PYRIGHT_REMOTE_HOST
-- g:pyright_remote_env / PYRIGHT_REMOTE_ENV
-- g:pyright_remote_workspace_root / PYRIGHT_REMOTE_ROOT
-- g:pyright_remote_auto_install   install pyright if missing (default: false)
-- g:pyright_remote_start_notify   notify on start/reconnect (default: false)
+>lua
+    {
+      "song54573/oil-pyright-remote.nvim",
+      dependencies = { "stevearc/oil.nvim" }, -- required for oil-ssh:// buffers
+      lazy = false, -- start as soon as Python buffers open
+    }
+<
 
-Notes
-- Works best with oil.nvim for `oil-ssh://` buffers.
-- Requires SSH access and a Python virtualenv on the remote host; pyright is installed on demand if missing.
+The entry file `plugin/oil_pyright_remote.lua` requires `oil_pyright_remote`,
+so commands/autocmds register automatically.
+
+
+REMOTE PREREQUISITES ~
+
+- SSH access to the target host (key or agent recommended).
+- A Python virtualenv on the remote host; pyright will be installed on demand if missing (see `g:pyright_remote_auto_install`).
+- Optional: oil.nvim to open buffers as `oil-ssh://host//path`, enabling seamless path conversion for jumps and diagnostics.
+
+
+COMMANDS                 *oil_pyright_remote-oil-pyright-remote.nvim-commands*
+
+- `:PyrightRemoteHost [host]` — set/show remote host (completes from `~/.ssh/config`).
+- `:PyrightRemoteEnv [env_dir]` — set/show remote virtualenv root; remembers history and lets you pick interactively.
+- `:PyrightRemoteRoot [path]` — pin workspace root (remote path). Default: directory of current file.
+- `:PyrightRemoteRestart` — restart the oil_pyright_remote client for the current buffer.
+- `:PyrightRemoteEnvForget [env_dir]` — forget one or all remembered environments.
+
+Pyright is started automatically on `FileType python`. If startup fails,
+prompts will guide you to re-enter host/env/python paths.
+
+
+CONFIGURATION (GLOBALS OR ENVIRONMENT)*oil_pyright_remote-oil-pyright-remote.nvim-configuration-(globals-or-environment)*
+
+  ---------------------------------------------------------------------------------
+  Variable                          Purpose                 Default
+  --------------------------------- ----------------------- -----------------------
+  g:pyright_remote_host /           SSH host                none
+  PYRIGHT_REMOTE_HOST                                       
+
+  g:pyright_remote_env /            Remote virtualenv root  none
+  PYRIGHT_REMOTE_ENV                                        
+
+  g:pyright_remote_workspace_root / Fixed workspace root    auto-detected
+  PYRIGHT_REMOTE_ROOT                                       
+
+  g:pyright_remote_auto_install     Install pyright if      false
+                                    missing                 
+
+  g:pyright_remote_start_notify     Notify on               false
+                                    start/reconnect         
+  ---------------------------------------------------------------------------------
+
+Generated by panvimdoc <https://github.com/kdheepak/panvimdoc>
 
 vim:tw=78:ts=8:noet:ft=help:norl:
