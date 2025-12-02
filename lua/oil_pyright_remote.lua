@@ -601,11 +601,19 @@ local function ensure_env_and_pyright_async(cb, opts)
 
           local retry = vim.fn.input(
             string.format(
+<<<<<<< Updated upstream
               "Remote python missing or not executable (host=%s code=%d): %s\nOutput:\n%s\nRe-enter remote python path (leave empty to keep current): ",
               host,
               code_py or -1,
               py_bin,
               table.concat(out_py or {}, "\n")
+=======
+              "Remote python missing or not executable (host=%s code=%d): %s\\nOutput:\\n%s\\nRe-enter remote python path (leave empty to keep current): ",
+              host,
+              code_py or -1,
+              py_bin,
+              table.concat(out_py or {}, "\\n")
+>>>>>>> Stashed changes
             )
           )
           retry = vim.fn.trim(retry)
@@ -657,11 +665,15 @@ local function ensure_env_and_pyright_async(cb, opts)
           cb(false)
         end
 
+<<<<<<< Updated upstream
         if vim.in_fast_event() then
           vim.schedule(handle_missing_py)
         else
           handle_missing_py()
         end
+=======
+        vim.schedule(handle_missing_py)
+>>>>>>> Stashed changes
         return
       end
 
@@ -691,7 +703,6 @@ local function ensure_env_and_pyright_async(cb, opts)
       end, opts)
     end)
   end
-
   if not prompted_env then
     prompt_env_path_async(function(py_bin)
       prompted_env = true
