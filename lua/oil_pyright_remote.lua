@@ -34,6 +34,10 @@ local state = {
   auto_install = vim.g.pyright_remote_auto_install,
   start_notify = vim.g.pyright_remote_start_notify,
 }
+-- normalize unset values to empty strings so string ops don't error
+state.host = state.host or ""
+state.env = state.env or ""
+state.root = state.root or ""
 if state.auto_install == nil then
   state.auto_install = false
 end
@@ -549,6 +553,27 @@ local function ensure_env_and_pyright_async(cb, opts)
     vim.notify(msg, level or vim.log.levels.INFO)
   end
 
+  -- host is required for any remote work; prompt once then bail quietly
+  if not state.host or state.host == "" then
+    if prompt_allowed then
+      local h = vim.fn.input("Remote SSH host (as in ~/.ssh/config): ")
+      h = vim.fn.trim(h)
+      if h ~= nil and h ~= "" then
+        set_state("host", h)
+      end
+    end
+    if not state.host or state.host == "" then
+      if not quiet then
+        vim.notify(
+          "[pyright_remote] host not set; skipping start. Set with :PyrightRemoteHost <host> or open an oil-ssh:// buffer.",
+          vim.log.levels.WARN
+        )
+      end
+      cb(false)
+      return
+    end
+  end
+
   if state.env and has_valid_env(state.host, state.env) then
     prompted_env = true
     cb(true)
@@ -556,68 +581,91 @@ local function ensure_env_and_pyright_async(cb, opts)
   end
 
   local function continue_with_py(py_bin)
+    local host = state.host ~= "" and state.host or "?"
     python_exists_async(py_bin, function(ok_py, out_py, code_py)
       if not ok_py then
-        local retry = vim.fn.input(
-          string.format(
-            "Remote python missing or not executable (host=%s code=%d): %s\nOutput:\n%s\nRe-enter remote python path (leave empty to keep current): ",
-            state.host,
-            code_py or -1,
-            py_bin,
-            table.concat(out_py or {}, "\n")
+        local function handle_missing_py()
+          if not prompt_allowed then
+            vim.notify(
+              string.format(
+                "[pyright_remote] remote python unavailable; skipping start. host=%s path=%s",
+                host,
+                py_bin
+              ),
+              vim.log.levels.ERROR
+            )
+            checked_env = string.format("%s|%s:missing", host, state.env or "")
+            cb(false)
+            return
+          end
+
+          local retry = vim.fn.input(
+            string.format(
+              "Remote python missing or not executable (host=%s code=%d): %s\nOutput:\n%s\nRe-enter remote python path (leave empty to keep current): ",
+              host,
+              code_py or -1,
+              py_bin,
+              table.concat(out_py or {}, "\n")
+            )
           )
-        )
-        retry = vim.fn.trim(retry)
-        if retry ~= nil and retry ~= "" then
-          py_bin = retry
-          local env_dir = normalize_env(retry)
-          set_state("env", env_dir)
-          py_bin = env_dir and (env_dir .. "/bin/python") or retry
-          python_exists_async(py_bin, function(ok_py2, out_py2, code_py2)
-            if not ok_py2 then
-              vim.notify(
-                string.format(
-                  "[pyright_remote] remote python unavailable; skipping start. host=%s path=%s",
-                  state.host,
-                  py_bin
-                ),
-                vim.log.levels.ERROR
-              )
-              checked_env = state.host .. "|" .. (state.env or "") .. ":missing"
-              cb(false)
-              return
-            end
-            ensure_pyright_installed_async(py_bin, function(ok4, declined4)
-              local cache_key = state.host .. "|" .. state.env
-              if ok4 then
-                checked_env = cache_key
-                mark_valid_env(state.host, state.env)
-                cb(true)
-              else
-                if declined4 then
-                  checked_env = cache_key .. ":missing"
-                end
+          retry = vim.fn.trim(retry)
+          if retry ~= nil and retry ~= "" then
+            py_bin = retry
+            local env_dir = normalize_env(retry)
+            set_state("env", env_dir)
+            py_bin = env_dir and (env_dir .. "/bin/python") or retry
+            python_exists_async(py_bin, function(ok_py2, out_py2, code_py2)
+              if not ok_py2 then
+                vim.notify(
+                  string.format(
+                    "[pyright_remote] remote python unavailable; skipping start. host=%s path=%s",
+                    host,
+                    py_bin
+                  ),
+                  vim.log.levels.ERROR
+                )
+                checked_env = string.format("%s|%s:missing", host, state.env or "")
                 cb(false)
+                return
               end
-            end, opts)
-          end)
-          return
+              ensure_pyright_installed_async(py_bin, function(ok4, declined4)
+                local cache_key = string.format("%s|%s", host, state.env or "")
+                if ok4 then
+                  checked_env = cache_key
+                  mark_valid_env(state.host, state.env)
+                  cb(true)
+                else
+                  if declined4 then
+                    checked_env = cache_key .. ":missing"
+                  end
+                  cb(false)
+                end
+              end, opts)
+            end)
+            return
+          end
+
+          vim.notify(
+            string.format(
+              "[pyright_remote] remote python unavailable; skipping start. host=%s path=%s",
+              host,
+              py_bin
+            ),
+            vim.log.levels.ERROR
+          )
+          checked_env = string.format("%s|%s:missing", host, state.env or "")
+          cb(false)
         end
 
-        vim.notify(
-          string.format(
-            "[pyright_remote] remote python unavailable; skipping start. host=%s path=%s",
-            state.host,
-            py_bin
-          ),
-          vim.log.levels.ERROR
-        )
-        checked_env = state.host .. "|" .. (state.env or "") .. ":missing"
-        cb(false)
+        if vim.in_fast_event() then
+          vim.schedule(handle_missing_py)
+        else
+          handle_missing_py()
+        end
         return
       end
 
-      local cache_key = state.host .. "|" .. state.env
+      local cache_key = string.format("%s|%s", host, state.env or "")
       if checked_env == cache_key then
         cb(true)
         return
@@ -1312,7 +1360,8 @@ end)
 
 vim.api.nvim_create_user_command("PyrightRemoteHost", function(opts)
   if opts.args == "" then
-    vim.notify(string.format("[pyright_remote] current host: %s", state.host), vim.log.levels.INFO)
+    local cur = (state.host ~= "" and state.host) or "<unset>"
+    vim.notify(string.format("[pyright_remote] current host: %s", cur), vim.log.levels.INFO)
     return
   end
   set_state("host", opts.args)
