@@ -599,7 +599,8 @@ local function ensure_env_and_pyright_async(cb, opts)
             return
           end
 
-          local retry = vim.fn.input(
+          local ok_input, retry = pcall(
+            vim.fn.input,
             string.format(
               "Remote python missing or not executable (host=%s code=%d): %s\nOutput:\n%s\nRe-enter remote python path (leave empty to keep current): ",
               host,
@@ -608,8 +609,17 @@ local function ensure_env_and_pyright_async(cb, opts)
               table.concat(out_py or {}, "\n")
             )
           )
-          retry = vim.fn.trim(retry)
-          if retry ~= nil and retry ~= "" then
+          if not ok_input then
+            vim.notify(
+              "[pyright_remote] prompt unavailable; set :PyrightRemoteEnv /path/to/venv (or g:pyright_remote_env) and retry",
+              vim.log.levels.WARN
+            )
+            checked_env = string.format("%s|%s:missing", host, state.env or "")
+            cb(false)
+            return
+          end
+          retry = vim.fn.trim(retry or "")
+          if retry ~= "" then
             py_bin = retry
             local env_dir = normalize_env(retry)
             set_state("env", env_dir)
