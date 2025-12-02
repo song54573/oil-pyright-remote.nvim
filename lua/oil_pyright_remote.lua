@@ -657,11 +657,8 @@ local function ensure_env_and_pyright_async(cb, opts)
           cb(false)
         end
 
-        if vim.in_fast_event() then
-          vim.schedule(handle_missing_py)
-        else
-          handle_missing_py()
-        end
+        -- Always schedule to avoid calling input from job callbacks / fast events.
+        vim.schedule(handle_missing_py)
         return
       end
 
