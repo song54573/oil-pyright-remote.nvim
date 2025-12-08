@@ -925,6 +925,16 @@ local function pyright_on_exit(code, signal, client_id)
     return
   end
   local client = client_id and vim.lsp.get_client_by_id and vim.lsp.get_client_by_id(client_id)
+  -- fast event 中直接调用 nvim_buf_is_valid 会触发 E5560，这里转到安全上下文
+  if vim.in_fast_event() then
+    vim.schedule(function()
+      local target_buf = pick_reconnect_buf(client)
+      if target_buf then
+        schedule_reconnect(target_buf, code, signal)
+      end
+    end)
+    return
+  end
   local target_buf = pick_reconnect_buf(client)
   if target_buf then
     schedule_reconnect(target_buf, code, signal)
