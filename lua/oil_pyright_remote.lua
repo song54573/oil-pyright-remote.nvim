@@ -1193,6 +1193,11 @@ function enable_pyright_remote(bufnr)
   reconnect.last_buf = bufnr
   stop_reconnect_timer()
 
+  -- 仅处理 python 缓冲，防止意外 attach 到其他 filetype（如 yaml）
+  if vim.bo[bufnr].filetype ~= "python" then
+    return
+  end
+
   local name = vim.api.nvim_buf_get_name(bufnr)
   local h = name:match("^oil%-ssh://([^/]+)//")
   if h and h ~= "" then
