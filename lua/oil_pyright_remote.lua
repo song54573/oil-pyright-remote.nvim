@@ -1065,10 +1065,22 @@ jump_with_oil = function(err, result, ctx, _)
     if not fname or fname == "" then
       return
     end
-
-    vim.cmd("edit " .. vim.fn.fnameescape(fname))
-    local bufnr = vim.api.nvim_get_current_buf()
+    local bufnr
     local win = vim.api.nvim_get_current_win()
+
+    -- 优先复用当前/已载入的 buffer，避免 :edit 重新加载导致状态刷新
+    if fname == vim.api.nvim_buf_get_name(0) then
+      bufnr = vim.api.nvim_get_current_buf()
+    else
+      local existing = vim.fn.bufnr(fname, false)
+      if existing > 0 and vim.api.nvim_buf_is_loaded(existing) then
+        bufnr = existing
+      else
+        bufnr = vim.fn.bufadd(fname)
+        vim.fn.bufload(bufnr)
+      end
+      vim.api.nvim_set_current_buf(bufnr)
+    end
 
     local pos = loc.range and loc.range.start or { line = 0, character = 0 }
     local line = (pos.line or 0) + 1
