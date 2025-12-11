@@ -144,9 +144,29 @@ function M.build_config(bufnr)
   -- 获取缓冲区路径并计算工作区根目录
   local bufname = vim.api.nvim_buf_get_name(bufnr)
   local remote_path = path.from_oil_path(bufname) or vim.fn.fnamemodify(bufname, ":p")
-  local root_dir = config.get("root") or vim.fn.fnamemodify(remote_path, ":h")
+
+  -- 使用配置的 root 或查找项目根目录
+  local root_dir = config.get("root")
   if not root_dir or root_dir == "" then
-    root_dir = "/"
+    -- 使用 root_markers 查找项目根目录
+    local markers = { "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".git" }
+    root_dir = vim.fn.fnamemodify(remote_path, ":p:h")
+
+    -- 向上遍历查找标记
+    while root_dir ~= "/" do
+      for _, marker in ipairs(markers) do
+        if vim.fn.glob(root_dir .. "/" .. marker) ~= "" then
+          goto found_root
+        end
+      end
+      root_dir = vim.fn.fnamemodify(root_dir, ":h")
+    end
+    ::found_root::
+
+    -- 如果没找到，使用文件所在目录
+    if root_dir == "/" then
+      root_dir = vim.fn.fnamemodify(remote_path, ":p:h")
+    end
   end
 
   cfg.root_dir = root_dir

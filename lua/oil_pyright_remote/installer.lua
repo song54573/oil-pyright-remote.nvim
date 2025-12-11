@@ -55,6 +55,13 @@ function M.prompt_env_path_async(cb, opts)
     cb(default_py)
   end
 
+  -- 检查是否允许自动提示
+  local auto_prompt = config.get("auto_prompt")
+  if not auto_prompt then
+    cb(nil)
+    return
+  end
+
   -- 检查是否有配置的环境
   local current_env = config.get("env")
   if not current_env or current_env == "" then

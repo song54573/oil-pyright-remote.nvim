@@ -43,3 +43,4 @@ Pyright is started automatically on `FileType python`. If startup fails, prompts
 | `g:pyright_remote_workspace_root` / `PYRIGHT_REMOTE_ROOT` | Fixed workspace root | auto-detected |
 | `g:pyright_remote_auto_install` | Install pyright if missing | `false` |
 | `g:pyright_remote_start_notify` | Notify on start/reconnect | `false` |
+| `g:pyright_remote_auto_prompt` | Auto-prompt for environment path | `true` |

@@ -10,6 +10,7 @@ local defaults = {
   root = "",              -- 远程工作区根目录
   auto_install = false,   -- 自动安装 pyright
   start_notify = false,   -- 启动时通知
+  auto_prompt = true,     -- 自动提示输入环境路径
 }
 
 -- 当前配置缓存
