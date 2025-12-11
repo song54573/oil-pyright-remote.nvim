@@ -10,6 +10,16 @@ local state = require("oil_pyright_remote.state")
 local ssh_runner = require("oil_pyright_remote.ssh_runner")
 
 -----------------------------------------------------------------------
+-- 全局浮动窗口状态（用于环境选择界面，防止浮窗遗留）
+-----------------------------------------------------------------------
+local floating_state = {
+  win = nil,    -- 当前浮窗窗口 id
+  buf = nil,    -- 当前浮窗 buffer id
+  timer = nil,  -- 兜底超时计时器
+  closed = true -- 是否已清理完成
+}
+
+-----------------------------------------------------------------------
 -- 辅助函数：统一的日志输出
 -----------------------------------------------------------------------
 local function notify(msg, level, quiet)
@@ -100,12 +110,54 @@ end
 --   host - 主机名
 --   cb   - 回调函数 cb(selected_env)
 function M.select_env_async(host, cb)
+  -- 先清理旧的浮窗，避免残留
+  M.cleanup_floating_window()
+
   local envs = state.list_envs(host)
   if not envs or #envs == 0 then
     cb(nil)
     return
   end
 
+  -- 首选原生 vim.ui.select，减少自绘浮窗残留几率
+  if vim.ui.select then
+    floating_state.closed = false
+    floating_state.timer = vim.loop.new_timer()
+
+    -- 兜底 15s 超时，超时自动收尾
+    floating_state.timer:start(15000, 0, function()
+      vim.schedule(function()
+        if not floating_state.closed then
+          floating_state.closed = true
+          cb(nil)
+        end
+        if floating_state.timer then
+          floating_state.timer:close()
+          floating_state.timer = nil
+        end
+      end)
+    end)
+
+    vim.ui.select(envs, {
+      prompt = "Select Python virtual environment:",
+      format_item = function(item)
+        return item
+      end,
+    }, function(choice)
+      if floating_state.closed then
+        return
+      end
+      floating_state.closed = true
+      if floating_state.timer then
+        floating_state.timer:close()
+        floating_state.timer = nil
+      end
+      cb(choice)
+    end)
+    return
+  end
+
+  -- 自绘浮窗回退方案
   local maxlen = 0
   for _, v in ipairs(envs) do
     maxlen = math.max(maxlen, #v)
@@ -130,22 +182,34 @@ function M.select_env_async(host, cb)
     border = "rounded",
   })
 
-  local closed = false
+  floating_state.win = win
+  floating_state.buf = buf
+  floating_state.closed = false
+
   local cursor = 1
   vim.api.nvim_win_set_cursor(win, { cursor, 0 })
 
   local function finish(choice)
-    if closed then
+    if floating_state.closed then
       return
     end
-    closed = true
-    -- 用 pcall 确保异常不阻断清理，避免浮窗卡死
+    floating_state.closed = true
+
+    if floating_state.timer then
+      floating_state.timer:close()
+      floating_state.timer = nil
+    end
+
     if win and vim.api.nvim_win_is_valid(win) then
       pcall(vim.api.nvim_win_close, win, true)
     end
     if buf and vim.api.nvim_buf_is_valid(buf) then
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
+
+    floating_state.win = nil
+    floating_state.buf = nil
+
     cb(choice)
   end
 
@@ -195,10 +259,36 @@ function M.select_env_async(host, cb)
     end,
   })
 
-  -- 兜底超时（45s）防遗留：用户没做选择也会自动收尾
-  vim.defer_fn(function()
-    finish(nil)
-  end, 45000)
+  -- 兜底超时（15s）防遗留
+  floating_state.timer = vim.loop.new_timer()
+  floating_state.timer:start(15000, 0, function()
+    vim.schedule(function()
+      finish(nil)
+    end)
+  end)
+end
+
+-----------------------------------------------------------------------
+-- M.cleanup_floating_window()
+-- 功能：显式清理当前浮窗（供退出或重新打开时调用）
+-----------------------------------------------------------------------
+function M.cleanup_floating_window()
+  if floating_state.timer then
+    floating_state.timer:close()
+    floating_state.timer = nil
+  end
+
+  if floating_state.win and vim.api.nvim_win_is_valid(floating_state.win) then
+    pcall(vim.api.nvim_win_close, floating_state.win, true)
+  end
+
+  if floating_state.buf and vim.api.nvim_buf_is_valid(floating_state.buf) then
+    pcall(vim.api.nvim_buf_delete, floating_state.buf, { force = true })
+  end
+
+  floating_state.win = nil
+  floating_state.buf = nil
+  floating_state.closed = true
 end
 
 -----------------------------------------------------------------------

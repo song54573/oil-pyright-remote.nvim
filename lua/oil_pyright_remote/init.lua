@@ -128,7 +128,11 @@ end
 
 -- 注册清理钩子
 vim.api.nvim_create_autocmd("VimLeavePre", {
-  callback = M.cleanup,
+  callback = function()
+    -- 先清理浮窗再做通用清理，避免残留窗口
+    installer.cleanup_floating_window()
+    M.cleanup()
+  end,
 })
 
 -- 导出子模块（用于高级用法或测试）
