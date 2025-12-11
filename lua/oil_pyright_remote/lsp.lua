@@ -10,6 +10,7 @@ local state = require("oil_pyright_remote.state")
 local path = require("oil_pyright_remote.path")
 local ssh_runner = require("oil_pyright_remote.ssh_runner")
 local installer = require("oil_pyright_remote.installer")
+local diagnostics = require("oil_pyright_remote.diagnostics")
 
 -- 模块状态
 local initialized = false
@@ -235,6 +236,8 @@ function M.build_config(bufnr)
     on_attach = M.on_attach,
     capabilities = capabilities,
     bufnr = bufnr,
+    handlers = M.handlers,                  -- 注入自定义处理器，确保诊断 URI 转换生效
+    _pyright_remote_host = config.get("host"), -- 将主机信息写入客户端配置，处理器可读取，避免 host 为空导致诊断丢失
     settings = {
       python = {
         analysis = {
@@ -424,7 +427,8 @@ function M.setup(capabilities_override)
   })
 
   -- 配置默认处理器
-  M.handlers = vim.deepcopy(M.get_default_handlers())
+  -- 统一使用 diagnostics 模块的处理器，避免与 init.lua 重复逻辑
+  M.handlers = diagnostics.get_handlers(M.jump_with_oil)
 
   -- 注册 LSP 配置（如果支持）
   if vim.lsp and vim.lsp.config then

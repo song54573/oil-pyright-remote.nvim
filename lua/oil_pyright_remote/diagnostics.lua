@@ -126,9 +126,23 @@ end
 function M.get_publish_diagnostics_handler()
   return function(err, params, ctx, cfg)
     if params and params.uri then
+      -- 优先读取当前客户端在 config 中存储的 host（客户端级别更可靠，避免依赖全局变量导致 host 为空）
+      local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id)
+      local host = (client and client.config and client.config._pyright_remote_host) or config.get("host")
+
       local fname = vim.uri_to_fname(params.uri)
-      -- 转换为 oil-ssh 路径
-      params.uri = path.to_oil_path(fname, config.get("host"))
+
+      -- 使用 pcall 包裹转换，避免 host 缺失或路径异常直接抛错导致诊断处理链中断
+      local ok, oil_uri = pcall(path.to_oil_path, fname, host)
+      if ok then
+        params.uri = oil_uri
+      else
+        -- 保留原始 URI，发出警告但不影响后续诊断显示
+        vim.notify(
+          string.format("[diagnostics] URI 转换失败，保持原值: %s -> %s", fname, tostring(oil_uri)),
+          vim.log.levels.WARN
+        )
+      end
 
       -- 处理相关信息的 URI 转换
       if params.diagnostics then
@@ -138,7 +152,15 @@ function M.get_publish_diagnostics_handler()
               local ri_uri = info.location and info.location.uri
               if ri_uri then
                 local rf = vim.uri_to_fname(ri_uri)
-                info.location.uri = path.to_oil_path(rf, config.get("host"))
+                local ok2, oil_ri_uri = pcall(path.to_oil_path, rf, host)
+                if ok2 then
+                  info.location.uri = oil_ri_uri
+                else
+                  vim.notify(
+                    string.format("[diagnostics] 关联 URI 转换失败，保持原值: %s -> %s", rf, tostring(oil_ri_uri)),
+                    vim.log.levels.WARN
+                  )
+                end
               end
             end
           end
