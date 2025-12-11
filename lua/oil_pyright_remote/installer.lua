@@ -139,11 +139,12 @@ function M.select_env_async(host, cb)
       return
     end
     closed = true
+    -- 用 pcall 确保异常不阻断清理，避免浮窗卡死
     if win and vim.api.nvim_win_is_valid(win) then
-      vim.api.nvim_win_close(win, true)
+      pcall(vim.api.nvim_win_close, win, true)
     end
     if buf and vim.api.nvim_buf_is_valid(buf) then
-      vim.api.nvim_buf_delete(buf, { force = true })
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
     cb(choice)
   end
@@ -178,13 +179,26 @@ function M.select_env_async(host, cb)
     move(-1)
   end, { buffer = buf, nowait = true, silent = true })
 
-  vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave" }, {
+  -- 更稳健的清理：离开、隐藏、窗口被外部关闭都立即收尾
+  vim.api.nvim_create_autocmd({ "BufLeave", "BufHidden" }, {
     buffer = buf,
     once = true,
     callback = function()
       finish(nil)
     end,
   })
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once = true,
+    callback = function()
+      finish(nil)
+    end,
+  })
+
+  -- 兜底超时（45s）防遗留：用户没做选择也会自动收尾
+  vim.defer_fn(function()
+    finish(nil)
+  end, 45000)
 end
 
 -----------------------------------------------------------------------

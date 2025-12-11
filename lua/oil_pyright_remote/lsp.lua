@@ -18,6 +18,73 @@ local capabilities = nil
 -- 支持的文件类型白名单（严格控制，避免错误附着）
 local SUPPORTED_FILETYPES = { "python" }
 
+-- 在远程主机上寻找项目根：逐级向上检测 root_markers
+local function find_remote_root(remote_path, markers)
+  -- 安全校验：缺主机或路径直接放弃
+  if not remote_path or remote_path == "" then
+    return nil
+  end
+  local host = config.get("host")
+  if not host or host == "" then
+    return nil
+  end
+
+  markers = markers or (M.get_default_config().root_markers or {})
+  if #markers == 0 then
+    return nil
+  end
+
+  -- Shell 安全转义，防止路径中包含空格或单引号
+  local function esc(str)
+    return (str or ""):gsub("'", "'\\''")
+  end
+
+  local quoted_markers = {}
+  for _, m in ipairs(markers) do
+    table.insert(quoted_markers, string.format([["%s"]], m))
+  end
+
+  -- 使用 ssh 在远程侧逐级检查标记文件，找到则回显根路径
+  local script = string.format([[
+p='%s'
+while true; do
+  for m in %s; do
+    if [ -e "$p/$m" ]; then echo "$p"; exit 0; fi
+  done
+  parent="$(dirname "$p")"
+  if [ "$parent" = "$p" ] || [ "$p" = "/" ]; then break; fi
+  p="$parent"
+done
+exit 1
+]], esc(vim.fn.fnamemodify(remote_path, ":p")), table.concat(quoted_markers, " "))
+
+  local stdout = {}
+  local job = vim.fn.jobstart(ssh_runner.remote_bash(script), {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      if not data then
+        return
+      end
+      for _, line in ipairs(data) do
+        if line ~= "" then
+          table.insert(stdout, line)
+        end
+      end
+    end,
+  })
+
+  if job <= 0 then
+    return nil
+  end
+
+  -- 最长等待 8s，失败则返回 nil 交给后续回退
+  local waited = vim.fn.jobwait({ job }, 8000)[1]
+  if waited ~= 0 or #stdout == 0 then
+    return nil
+  end
+  return stdout[1]
+end
+
 -----------------------------------------------------------------------
 -- 辅助函数：检查缓冲区是否为支持的文件类型
 -----------------------------------------------------------------------
@@ -145,28 +212,13 @@ function M.build_config(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr)
   local remote_path = path.from_oil_path(bufname) or vim.fn.fnamemodify(bufname, ":p")
 
-  -- 使用配置的 root 或查找项目根目录
+  -- 远程根目录：优先用户配置，其次远程检测，最后退回文件所在目录
   local root_dir = config.get("root")
   if not root_dir or root_dir == "" then
-    -- 使用 root_markers 查找项目根目录
-    local markers = { "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".git" }
-    root_dir = vim.fn.fnamemodify(remote_path, ":p:h")
-
-    -- 向上遍历查找标记
-    while root_dir ~= "/" do
-      for _, marker in ipairs(markers) do
-        if vim.fn.glob(root_dir .. "/" .. marker) ~= "" then
-          goto found_root
-        end
-      end
-      root_dir = vim.fn.fnamemodify(root_dir, ":h")
-    end
-    ::found_root::
-
-    -- 如果没找到，使用文件所在目录
-    if root_dir == "/" then
-      root_dir = vim.fn.fnamemodify(remote_path, ":p:h")
-    end
+    local markers = cfg.root_markers or M.get_default_config().root_markers
+    local base = vim.fn.fnamemodify(remote_path, ":p:h")
+    -- 在远程侧检查 root_markers；失败则直接用当前目录
+    root_dir = find_remote_root(base, markers) or base
   end
 
   cfg.root_dir = root_dir
