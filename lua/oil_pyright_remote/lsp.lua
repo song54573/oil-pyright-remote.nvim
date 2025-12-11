@@ -152,7 +152,7 @@ function M.on_attach(client, bufnr)
       virtual_text = { prefix = "●", spacing = 2 },
       signs = true,
       underline = true,
-      update_in_insert = false,
+      update_in_insert = true, -- 插入模式也更新诊断，保持实时可见
       severity_sort = true,
     })
     pcall(vim.diagnostic.enable, bufnr)

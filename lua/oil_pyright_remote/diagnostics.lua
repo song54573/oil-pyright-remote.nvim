@@ -28,7 +28,7 @@ function M.apply_on_attach(client, bufnr)
     virtual_text = { prefix = "●", spacing = 2 },
     signs = true,
     underline = true,
-    update_in_insert = false,
+    update_in_insert = true, -- 插入模式同样显示并更新诊断，方便即时反馈
     severity_sort = true,
   })
 

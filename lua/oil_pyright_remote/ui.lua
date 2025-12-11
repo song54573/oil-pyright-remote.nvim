@@ -23,7 +23,7 @@ function M.apply_diagnostic_ui(opts)
     virtual_text = { prefix = "●", spacing = 2 },
     signs = true,
     underline = true,
-    update_in_insert = false,
+    update_in_insert = true, -- 插入模式也刷新诊断，及时看到错误
     severity_sort = true,
   }
 
