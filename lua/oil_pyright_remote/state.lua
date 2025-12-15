@@ -30,6 +30,27 @@ local internal_state = {
   },
 }
 
+-----------------------------------------------------------------------
+-- 远程缓冲区判定（只对 oil-ssh:// 的 python 文件做重连）
+-- 说明：
+--   断网/重连场景下，如果我们对“当前随便一个 buffer”发起重连，会造成：
+--   - 无意义的 ssh 连接尝试
+--   - 触发诊断/通知的全局副作用（用户体感像 UI 坏了）
+-- 因此重连必须只针对：python + oil-ssh:// 缓冲区。
+-----------------------------------------------------------------------
+local function is_remote_python_buffer(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  if vim.bo[bufnr].filetype ~= "python" then
+    return false
+  end
+
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  return type(name) == "string" and name:match("^oil%-ssh://[^/]+") ~= nil
+end
+
 -- 文件路径配置
 local env_store_path = vim.fn.stdpath("data") .. "/pyright_remote_envs.json"
 local valid_store_path = vim.fn.stdpath("data") .. "/pyright_remote_validated.json"
@@ -374,17 +395,23 @@ end
 -- 参数：client - LSP客户端对象，可选
 -- 返回：缓冲区编号或nil
 function M.pick_reconnect_buf(client)
-  if client and client.attached_buffers then
-    for buf, attached in pairs(client.attached_buffers) do
-      if attached and vim.api.nvim_buf_is_valid(buf) then
-        return buf
-      end
-    end
+  local reconnect = internal_state.reconnect
+  -- 优先使用“最后一次成功启用”的缓冲区（更符合用户直觉，也更稳定）
+  if is_remote_python_buffer(reconnect.last_buf) then
+    return reconnect.last_buf
   end
 
-  local reconnect = internal_state.reconnect
-  if reconnect.last_buf and vim.api.nvim_buf_is_valid(reconnect.last_buf) then
-    return reconnect.last_buf
+  -- 回退：从 client.attached_buffers 中挑一个“仍然有效的远程 python 缓冲区”
+  -- 注意：pairs() 顺序不稳定，所以这里收集后排序，保证选择可预期。
+  if client and client.attached_buffers then
+    local candidates = {}
+    for buf, attached in pairs(client.attached_buffers) do
+      if attached and is_remote_python_buffer(buf) then
+        table.insert(candidates, buf)
+      end
+    end
+    table.sort(candidates)
+    return candidates[1]
   end
 end
 
@@ -401,7 +428,8 @@ function M.schedule_reconnect(bufnr, exit_code, signal)
     return
   end
 
-  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+  -- 只对远程 python 缓冲区做重连（避免误伤当前其他文件类型）
+  if not is_remote_python_buffer(bufnr) then
     return
   end
 
@@ -416,8 +444,8 @@ function M.schedule_reconnect(bufnr, exit_code, signal)
         return
       end
 
-      if not vim.api.nvim_buf_is_valid(bufnr) then
-        vim.notify("[pyright_remote] reconnect skipped: buffer no longer valid", vim.log.levels.WARN)
+      if not is_remote_python_buffer(bufnr) then
+        vim.notify("[pyright_remote] reconnect skipped: not a remote python buffer", vim.log.levels.WARN)
         return
       end
 

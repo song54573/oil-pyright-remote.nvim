@@ -1,5 +1,5 @@
 -- ui.lua: 用户界面和交互模块
--- 功能：处理诊断配置、按键映射、用户命令、主机列表、环境补全等
+-- 功能：处理用户命令、主机列表、环境补全、状态展示等
 -- 设计原则：集中管理 UI 交互，提供清晰的配置接口
 
 local M = {}
@@ -13,63 +13,11 @@ local initialized = false
 local user_command_deps = nil
 
 -----------------------------------------------------------------------
--- M.apply_diagnostic_ui(opts)
--- 功能：应用诊断显示配置
--- 参数：opts - 配置选项（可选）
-function M.apply_diagnostic_ui(opts)
-  opts = opts or {}
-
-  local diag_config = {
-    virtual_text = { prefix = "●", spacing = 2 },
-    signs = true,
-    underline = true,
-    update_in_insert = true, -- 插入模式也刷新诊断，及时看到错误
-    severity_sort = true,
-  }
-
-  -- 合并用户选项
-  if opts.diagnostic then
-    diag_config = vim.tbl_deep_extend("force", diag_config, opts.diagnostic)
-  end
-
-  vim.diagnostic.config(diag_config)
-
-  -- 设置诊断符号
-  local diag_signs = opts.diagnostic_signs or { Error = "E", Warn = "W", Hint = "H", Info = "I" }
-  for type, icon in pairs(diag_signs) do
-    local hl = "DiagnosticSign" .. type
-    vim.fn.sign_define(hl, { text = icon, texthl = hl, numhl = "" })
-  end
-end
-
------------------------------------------------------------------------
--- M.setup_keymaps()
--- 功能：设置诊断相关按键映射
-function M.setup_keymaps()
-  vim.keymap.set("n", "<leader>e", function()
-    vim.diagnostic.open_float(nil, { scope = "line" })
-  end, { desc = "Line diagnostics" })
-end
-
------------------------------------------------------------------------
 -- M.create_user_commands(deps)
 -- 功能：创建所有用户命令
 -- 参数：deps - 依赖表，包含重启函数等
 function M.create_user_commands(deps)
   user_command_deps = deps or {}
-
-  -- 诊断相关命令
-  vim.api.nvim_create_user_command("DiagVirtualTextOn", function()
-    M.apply_diagnostic_ui({
-      diagnostic = { virtual_text = { prefix = "●", spacing = 2 }, signs = true }
-    })
-    vim.notify("[diagnostic] virtual text ON", vim.log.levels.INFO)
-  end, { nargs = 0 })
-
-  vim.api.nvim_create_user_command("DiagVirtualTextOff", function()
-    vim.diagnostic.config({ virtual_text = false })
-    vim.notify("[diagnostic] virtual text OFF", vim.log.levels.INFO)
-  end, { nargs = 0 })
 
   -- 主机配置命令
   vim.api.nvim_create_user_command("PyrightRemoteHost", function(opts)
@@ -208,23 +156,12 @@ end
 -- M.setup(opts)
 -- 功能：初始化 UI 模块
 -- 参数：opts - 配置选项，包含：
---          diagnostic: 诊断配置
---          diagnostic_signs: 诊断符号配置
---          keymaps: 是否设置按键映射
 --          commands: 依赖函数表
 function M.setup(opts)
   opts = opts or {}
 
   if initialized then
     return
-  end
-
-  -- 应用诊断 UI
-  M.apply_diagnostic_ui(opts)
-
-  -- 设置按键映射
-  if opts.keymaps ~= false then
-    M.setup_keymaps()
   end
 
   -- 创建用户命令

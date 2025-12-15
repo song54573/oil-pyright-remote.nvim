@@ -61,6 +61,7 @@ function M.setup(opts)
   -- 初始化诊断模块
   diagnostics.setup({
     signs = opts.diagnostic_signs,
+    diagnostic = opts.diagnostic,
     commands = opts.commands,
     keymaps = opts.keymaps,
     jump_func = lsp.jump_with_oil,

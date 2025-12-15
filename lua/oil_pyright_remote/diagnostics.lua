@@ -11,6 +11,76 @@ local path = require("oil_pyright_remote.path")
 -- 模块状态
 local initialized = false
 local handlers = {}
+local diagnostic_config = nil
+
+-- 已知的“pyright_remote 诊断命名空间”集合（key=ns, value=true）
+-- 用途：当用户执行 :DiagVirtualTextOn/Off 等命令时，我们可以仅更新本插件相关的命名空间配置，
+-- 避免误改其他 LSP/文件类型的诊断显示。
+local diagnostic_namespaces = {}
+
+-----------------------------------------------------------------------
+-- build_diagnostic_config(user_cfg)
+-- 功能：构建本插件的诊断显示配置（默认值 + 用户覆盖）
+-- 说明：
+--   - 这里不直接调用 vim.diagnostic.config，因为那样会影响全局
+--   - 真正应用配置由 apply_on_attach 在“客户端诊断命名空间”上完成
+-----------------------------------------------------------------------
+local function build_diagnostic_config(user_cfg)
+  local base = {
+    virtual_text = { prefix = "●", spacing = 2 },
+    signs = true,
+    underline = true,
+    update_in_insert = true, -- 插入模式同样显示并更新诊断，方便即时反馈
+    severity_sort = true,
+  }
+
+  if type(user_cfg) == "table" then
+    return vim.tbl_deep_extend("force", base, user_cfg)
+  end
+  return base
+end
+
+-----------------------------------------------------------------------
+-- get_client_diagnostic_namespace(client)
+-- 功能：获取某个 LSP client 的诊断命名空间（namespace）
+-- 说明：
+--   Neovim 会为每个 LSP client 分配独立的诊断 namespace。
+--   只有在该 namespace 上配置 vim.diagnostic.config，才能做到“只影响本 client 的诊断显示”。
+-----------------------------------------------------------------------
+local function get_client_diagnostic_namespace(client)
+  if not client or not client.id then
+    return nil
+  end
+
+  -- 兼容不同版本：该函数在 0.8+ 通常可用
+  if vim.lsp and vim.lsp.diagnostic and vim.lsp.diagnostic.get_namespace then
+    return vim.lsp.diagnostic.get_namespace(client.id)
+  end
+
+  return nil
+end
+
+-----------------------------------------------------------------------
+-- enable_diagnostics(bufnr, namespace)
+-- 功能：兼容性封装：仅启用指定 namespace 的诊断
+-- 说明：
+--   不同 Neovim 版本对 vim.diagnostic.enable 的参数签名略有差异。
+--   我们按“新 -> 旧”的顺序尝试，保证尽量不报错。
+-----------------------------------------------------------------------
+local function enable_diagnostics(bufnr, namespace)
+  if not namespace then
+    pcall(vim.diagnostic.enable, bufnr)
+    return
+  end
+
+  -- 新签名：enable(bufnr, namespace)
+  if pcall(vim.diagnostic.enable, bufnr, namespace) then
+    return
+  end
+
+  -- 旧签名：enable(bufnr, { namespace = namespace })
+  pcall(vim.diagnostic.enable, bufnr, { namespace = namespace })
+end
 
 -----------------------------------------------------------------------
 -- M.apply_on_attach(client, bufnr)
@@ -23,17 +93,21 @@ function M.apply_on_attach(client, bufnr)
     return
   end
 
-  -- 配置诊断显示
-  pcall(vim.diagnostic.config, {
-    virtual_text = { prefix = "●", spacing = 2 },
-    signs = true,
-    underline = true,
-    update_in_insert = true, -- 插入模式同样显示并更新诊断，方便即时反馈
-    severity_sort = true,
-  })
+  -- 只在“本 client 的诊断命名空间”上配置，避免污染全局诊断显示
+  local ns = get_client_diagnostic_namespace(client)
+  if ns then
+    diagnostic_namespaces[ns] = true
+  end
 
-  -- 启用诊断
-  pcall(vim.diagnostic.enable, bufnr)
+  -- 如果 setup 尚未执行（理论上不应发生），兜底用默认配置
+  diagnostic_config = diagnostic_config or build_diagnostic_config(nil)
+
+  -- 重要：第二个参数传 ns，表示“只对该 namespace 生效”
+  -- 若 ns 为 nil，会退化为全局配置（不推荐），但为了不让诊断完全消失，这里仍做兜底。
+  pcall(vim.diagnostic.config, diagnostic_config, ns)
+
+  -- 启用诊断（尽量只启用本 namespace）
+  enable_diagnostics(bufnr, ns)
 end
 
 -----------------------------------------------------------------------
@@ -41,21 +115,28 @@ end
 -- 功能：切换虚拟文本显示
 -- 参数：enabled - 布尔值，nil 表示切换状态
 function M.toggle_virtual_text(enabled)
+  -- 这里的目标是“只影响 pyright_remote 的诊断”，因此我们只更新已记录的 namespace。
+  -- 如果当前还没有任何 namespace（比如尚未 attach），就仅更新内存配置，等 attach 时生效。
+
+  diagnostic_config = diagnostic_config or build_diagnostic_config(nil)
+
   if enabled == nil then
-    -- 切换状态
-    local current = vim.diagnostic.config().virtual_text
-    enabled = not current
+    -- 切换状态：优先读取当前内存配置
+    enabled = not diagnostic_config.virtual_text
   end
 
   if enabled then
-    vim.diagnostic.config({
-      virtual_text = { prefix = "●", spacing = 2 },
-      signs = true,
-    })
+    diagnostic_config.virtual_text = { prefix = "●", spacing = 2 }
+    diagnostic_config.signs = true
     vim.notify("[diagnostic] virtual text ON", vim.log.levels.INFO)
   else
-    vim.diagnostic.config({ virtual_text = false })
+    diagnostic_config.virtual_text = false
     vim.notify("[diagnostic] virtual text OFF", vim.log.levels.INFO)
+  end
+
+  -- 将更新后的配置应用到所有已知 namespace（只影响本插件的诊断）
+  for ns, _ in pairs(diagnostic_namespaces) do
+    pcall(vim.diagnostic.config, diagnostic_config, ns)
   end
 end
 
@@ -278,6 +359,9 @@ function M.setup(opts)
     return
   end
 
+  -- 保存诊断显示配置（默认 + 用户覆盖）
+  diagnostic_config = build_diagnostic_config(opts.diagnostic)
+
   -- 设置诊断符号
   if opts.signs then
     M.set_diagnostics_signs(opts.signs)
@@ -288,12 +372,12 @@ function M.setup(opts)
     M.create_toggle_commands()
   end
 
-  -- 设置按键映射
-  if opts.keymaps ~= false then
-    vim.keymap.set("n", "<leader>e", M.open_diagnostic_float, { desc = "Line diagnostics" })
-    vim.keymap.set("n", "[d", M.goto_prev_diagnostic, { desc = "Previous diagnostic" })
-    vim.keymap.set("n", "]d", M.goto_next_diagnostic, { desc = "Next diagnostic" })
-  end
+  -- 按键映射：建议由 LSP on_attach 做 buffer-local 绑定，避免影响非远程缓冲区。
+  -- 这里保留 opts.keymaps 参数用于向后兼容，但默认不再设置全局 keymap。
+  -- 若你确实需要全局 keymap，可在自己的配置中自行设置：
+  --   vim.keymap.set("n", "<leader>e", vim.diagnostic.open_float, { desc = "Line diagnostics" })
+  --   vim.keymap.set("n", "[d", vim.diagnostic.goto_prev, { desc = "Previous diagnostic" })
+  --   vim.keymap.set("n", "]d", vim.diagnostic.goto_next, { desc = "Next diagnostic" })
 
   -- 预生成处理器
   handlers = M.get_handlers(opts.jump_func)

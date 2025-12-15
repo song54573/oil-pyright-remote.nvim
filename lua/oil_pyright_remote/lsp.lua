@@ -19,6 +19,28 @@ local capabilities = nil
 -- 支持的文件类型白名单（严格控制，避免错误附着）
 local SUPPORTED_FILETYPES = { "python" }
 
+-----------------------------------------------------------------------
+-- 远程缓冲区判定（本插件只服务 oil-ssh:// 远程文件）
+-- 说明：
+--   - 本插件的 LSP 进程运行在远程主机，通过 ssh 传输 stdio
+--   - 因此对于本地 python 文件，不应该启动/附着本客户端
+--   - 这也是避免“重连后影响当前非 python 文件”的关键前置条件
+-----------------------------------------------------------------------
+local function get_oil_ssh_host_from_bufname(bufname)
+  if type(bufname) ~= "string" or bufname == "" then
+    return nil
+  end
+  -- 兼容两种形式：
+  --   1) oil-ssh://host//abs/path
+  --   2) oil-ssh://host/rel/or/abs
+  return bufname:match("^oil%-ssh://([^/]+)")
+end
+
+local function is_remote_oil_ssh_buffer(bufnr)
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  return get_oil_ssh_host_from_bufname(name) ~= nil
+end
+
 -- 在远程主机上寻找项目根：逐级向上检测 root_markers
 local function find_remote_root(remote_path, markers)
   -- 安全校验：缺主机或路径直接放弃
@@ -80,6 +102,11 @@ exit 1
 
   -- 最长等待 8s，失败则返回 nil 交给后续回退
   local waited = vim.fn.jobwait({ job }, 8000)[1]
+  -- 重要：如果 waited == -1 表示超时，job 仍在运行（通常是 ssh 卡住）。
+  -- 必须显式 jobstop，否则后台会残留 ssh 进程，次数一多会拖慢/卡住整个 Neovim。
+  if waited == -1 then
+    pcall(vim.fn.jobstop, job)
+  end
   if waited ~= 0 or #stdout == 0 then
     return nil
   end
@@ -92,7 +119,10 @@ end
 local function is_supported_buffer(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local ft = vim.bo[bufnr].filetype
-  return vim.tbl_contains(SUPPORTED_FILETYPES, ft)
+  -- 双重约束：
+  -- 1) 必须是 python
+  -- 2) 必须是 oil-ssh:// 远程缓冲区（防止对本地文件误附着/误诊断）
+  return vim.tbl_contains(SUPPORTED_FILETYPES, ft) and is_remote_oil_ssh_buffer(bufnr)
 end
 
 -----------------------------------------------------------------------
@@ -147,21 +177,19 @@ function M.on_attach(client, bufnr)
     -- 禁用格式化（通常由其他插件处理）
     client.server_capabilities.documentFormattingProvider = false
 
-    -- 配置诊断显示
-    pcall(vim.diagnostic.config, {
-      virtual_text = { prefix = "●", spacing = 2 },
-      signs = true,
-      underline = true,
-      update_in_insert = true, -- 插入模式也更新诊断，保持实时可见
-      severity_sort = true,
-    })
-    pcall(vim.diagnostic.enable, bufnr)
+    -- 配置诊断显示（只作用于 pyright_remote 的诊断命名空间，避免污染全局）
+    diagnostics.apply_on_attach(client, bufnr)
+
+    -- 诊断相关按键（buffer-local），避免影响非远程缓冲区
+    bufmap("n", "<leader>e", diagnostics.open_diagnostic_float, "Line diagnostics")
+    bufmap("n", "[d", diagnostics.goto_prev_diagnostic, "Previous diagnostic")
+    bufmap("n", "]d", diagnostics.goto_next_diagnostic, "Next diagnostic")
 
     -- 自定义跳转处理器，确保使用 oil 路径
     local function req(method)
       return function()
         local name = vim.api.nvim_buf_get_name(bufnr)
-        local h = name:match("^oil%-ssh://([^/]+)//")
+        local h = get_oil_ssh_host_from_bufname(name)
         if h and h ~= "" then
           config.set({ host = h })
         end
@@ -281,7 +309,7 @@ function M.enable_pyright_remote(bufnr)
 
   -- 从缓冲区名称提取主机信息
   local name = vim.api.nvim_buf_get_name(bufnr)
-  local h = name:match("^oil%-ssh://([^/]+)//")
+  local h = get_oil_ssh_host_from_bufname(name)
   if h and h ~= "" then
     config.set({ host = h })
   end
@@ -458,7 +486,7 @@ M.jump_with_oil = function(err, result, ctx, _)
   local enc = client and client.offset_encoding or "utf-16"
 
   local cur_name = vim.api.nvim_buf_get_name(0)
-  local cur_host = cur_name:match("^oil%-ssh://([^/]+)//")
+  local cur_host = get_oil_ssh_host_from_bufname(cur_name)
   if cur_host and cur_host ~= "" then
     config.set({ host = cur_host })
   end
