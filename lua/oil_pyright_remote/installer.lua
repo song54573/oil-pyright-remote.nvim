@@ -399,8 +399,132 @@ if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; e
 end
 
 -----------------------------------------------------------------------
+-- M.ensure_ty_installed_async(py_bin, cb, opts)
+-- 功能：确保 ty 已安装
+-- 参数：
+--   py_bin - python 路径
+--   cb     - 回调函数 cb(success, declined)
+--   opts   - 选项：
+--            quiet: 是否静默执行
+-- 返回：无
+function M.ensure_ty_installed_async(py_bin, cb, opts)
+  opts = opts or {}
+  local quiet = opts.quiet == true
+  local env = config.get("env")
+
+  local function run_check_async(next_cb)
+    local env_bin = env .. "/bin"
+    local script = string.format(
+      [[
+PYBIN="%s"
+ENV_BIN="%s"
+"$PYBIN" -V >/dev/null 2>&1 || exit 2
+if [ -x "$ENV_BIN/ty" ]; then "$ENV_BIN/ty" --version >/dev/null 2>&1 && exit 0; fi
+exit 1
+]],
+      py_bin,
+      env_bin
+    )
+
+    ssh_runner.execute_remote_script(script, function(ok, out, code)
+      state.set_last_check_out(out)
+      next_cb(ok, out, code)
+    end, { timeout = 15000, quiet = quiet })
+  end
+
+  run_check_async(function(ok, out, code)
+    if ok then
+      cb(true, false)
+      return
+    end
+
+    notify(
+      string.format("[installer] ty not found (code=%d). Output:\n%s", code, table.concat(out or {}, "\n")),
+      vim.log.levels.WARN,
+      quiet
+    )
+
+    local auto_install = config.get("auto_install")
+    local proceed_install = auto_install
+
+    if not proceed_install then
+      local ans = vim.fn.input("ty not detected in remote env. Install via pip? [y/N]: ")
+      proceed_install = ans:lower() == "y"
+    else
+      notify(string.format("[installer] auto-installing ty ... (%s)", env), vim.log.levels.INFO, quiet)
+    end
+
+    if not proceed_install then
+      notify("[installer] skipping ty install; LSP may fail to start", vim.log.levels.WARN, quiet)
+      cb(false, true)
+      return
+    end
+
+    -- 执行安装
+    local install_script = string.format(
+      [[
+PYBIN="%s"
+if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
+"$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
+"$PYBIN" -m pip install --no-user ty
+    ]],
+      py_bin
+    )
+
+    ssh_runner.execute_remote_script(install_script, function(ok2, output, code2)
+      if not ok2 then
+        notify(
+          "[installer] pip install ty failed: " .. table.concat(output or {}, "\n"),
+          vim.log.levels.ERROR
+        )
+        cb(false, false)
+        return
+      end
+
+      notify("[installer] pip install output:\n" .. table.concat(output or {}, "\n"), vim.log.levels.INFO, quiet)
+
+      -- 再次检查是否安装成功
+      run_check_async(function(ok3, out3, code3)
+        if not ok3 then
+          notify(
+            string.format(
+              "[installer] ty still missing after install (code=%d). Output:\n%s",
+              code3,
+              table.concat(out3 or {}, "\n")
+            ),
+            vim.log.levels.ERROR
+          )
+          cb(false, false)
+          return
+        end
+        notify("[installer] ty installed and validated", vim.log.levels.INFO, quiet)
+        cb(true, false)
+      end)
+    end, { timeout = 120000 })
+  end)
+end
+
+-----------------------------------------------------------------------
+-- M.ensure_lsp_installed_async(py_bin, cb, opts)
+-- 功能：根据backend配置确保对应的LSP已安装
+-- 参数：
+--   py_bin - python 路径
+--   cb     - 回调函数 cb(success, declined)
+--   opts   - 选项：
+--            quiet: 是否静默执行
+-- 返回：无
+function M.ensure_lsp_installed_async(py_bin, cb, opts)
+  local backend = config.get("backend")
+  if backend == "ty" then
+    M.ensure_ty_installed_async(py_bin, cb, opts)
+  else
+    M.ensure_pyright_installed_async(py_bin, cb, opts)
+  end
+end
+
+-----------------------------------------------------------------------
 -- M.ensure_env_and_pyright_async(cb, opts)
--- 功能：确保环境配置正确且 pyright 可用
+-- 功能：确保环境配置正确且 LSP 可用
 -- 参数：
 --   cb   - 回调函数 cb(ready)
 --   opts - 选项：
@@ -444,7 +568,8 @@ function M.ensure_env_and_pyright_async(cb, opts)
 
   -- 检查是否已经验证过此环境
   local env = config.get("env")
-  if env and state.has_valid_env(host, env) then
+  local backend = config.get("backend")
+  if env and state.has_valid_env(backend .. ":" .. host, env) then
     state.set_prompted_env(true)
     cb(true)
     return
@@ -461,7 +586,7 @@ function M.ensure_env_and_pyright_async(cb, opts)
           ),
           vim.log.levels.ERROR
         )
-        local cache_key = string.format("%s|%s:missing", host, env or "")
+        local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
         state.set_checked_env(cache_key)
         cb(false)
         return
@@ -483,7 +608,7 @@ function M.ensure_env_and_pyright_async(cb, opts)
           "[installer] prompt unavailable; set :PyrightRemoteEnv /path/to/venv (or g:pyright_remote_env) and retry",
           vim.log.levels.WARN
         )
-        local cache_key = string.format("%s|%s:missing", host, env or "")
+        local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
         state.set_checked_env(cache_key)
         cb(false)
         return
@@ -514,11 +639,11 @@ function M.ensure_env_and_pyright_async(cb, opts)
             return
           end
 
-          M.ensure_pyright_installed_async(py_bin, function(ok4, declined4)
-            local cache_key = string.format("%s|%s", host, config.get("env") or "")
+          M.ensure_lsp_installed_async(py_bin, function(ok4, declined4)
+            local cache_key = string.format("%s|%s|%s", backend, host, config.get("env") or "")
             if ok4 then
               state.set_checked_env(cache_key)
-              state.mark_valid_env(host, config.get("env"))
+              state.mark_valid_env(backend .. ":" .. host, config.get("env"))
               cb(true)
             else
               if declined4 then
@@ -551,7 +676,7 @@ function M.ensure_env_and_pyright_async(cb, opts)
         return
       end
 
-      local cache_key = string.format("%s|%s", host, config.get("env") or "")
+      local cache_key = string.format("%s|%s|%s", backend, host, config.get("env") or "")
       local checked_env = state.get_checked_env()
 
       if checked_env == cache_key then
@@ -565,10 +690,10 @@ function M.ensure_env_and_pyright_async(cb, opts)
 
       notify("[installer] checking remote python / pyright ...")
 
-      M.ensure_pyright_installed_async(py_bin, function(ok, declined)
+      M.ensure_lsp_installed_async(py_bin, function(ok, declined)
         if ok then
           state.set_checked_env(cache_key)
-          state.mark_valid_env(host, config.get("env"))
+          state.mark_valid_env(backend .. ":" .. host, config.get("env"))
           state.remember_env(host, config.get("env"))
           cb(true)
           return
@@ -613,7 +738,8 @@ function M.prewarm_env_async(host, env)
     return
   end
 
-  if state.has_valid_env(host, env) then
+  local backend = config.get("backend")
+  if state.has_valid_env(backend .. ":" .. host, env) then
     return
   end
 
@@ -622,9 +748,9 @@ function M.prewarm_env_async(host, env)
     if not ok_py then
       return
     end
-    M.ensure_pyright_installed_async(py_bin, function(ok, _)
+    M.ensure_lsp_installed_async(py_bin, function(ok, _)
       if ok then
-        state.mark_valid_env(host, env)
+        state.mark_valid_env(backend .. ":" .. host, env)
         state.remember_env(host, env)
       end
     end, { quiet = true })

@@ -279,8 +279,13 @@ function M.build_config(bufnr)
     },
   })
 
-  -- 构建启动命令
-  cfg.cmd = ssh_runner.build_pyright_cmd()
+  -- 构建启动命令（根据backend选择）
+  local backend = config.get("backend")
+  if backend == "ty" then
+    cfg.cmd = ssh_runner.build_ty_cmd()
+  else
+    cfg.cmd = ssh_runner.build_pyright_cmd()
+  end
 
   return cfg
 end

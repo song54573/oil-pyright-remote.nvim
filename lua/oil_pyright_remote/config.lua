@@ -8,7 +8,8 @@ local defaults = {
   host = "",              -- 远程 SSH 主机
   env = "",               -- 远程虚拟环境路径
   root = "",              -- 远程工作区根目录
-  auto_install = false,   -- 自动安装 pyright
+  backend = "pyright",    -- LSP 后端: "pyright" | "ty"
+  auto_install = false,   -- 自动安装 LSP
   start_notify = false,   -- 启动时通知
   auto_prompt = true,     -- 自动提示输入环境路径
 }
@@ -28,6 +29,7 @@ local vim_g_mappings = {
   pyright_remote_host = "host",
   pyright_remote_env = "env",
   pyright_remote_workspace_root = "root",
+  pyright_remote_backend = "backend",
   pyright_remote_auto_install = "auto_install",
   pyright_remote_start_notify = "start_notify",
 }
@@ -81,6 +83,12 @@ local function normalize_value(key, value)
     -- 引用 path 模块进行环境路径规范化
     local path = require("oil_pyright_remote.path")
     return path.normalize_env(value) or ""
+  elseif key == "backend" and type(value) == "string" then
+    -- backend 验证
+    if value ~= "pyright" and value ~= "ty" then
+      error(string.format("无效的 backend 值: %s (必须是 'pyright' 或 'ty')", value))
+    end
+    return value
   elseif key == "auto_install" or key == "start_notify" then
     -- 布尔值处理
     return value == true

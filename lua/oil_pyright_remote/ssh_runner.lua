@@ -233,6 +233,46 @@ fi]],
 end
 
 -----------------------------------------------------------------------
+-- M.build_ty_cmd()
+-- 功能：构建启动 ty server 的 SSH 命令
+-- 返回：适合 vim.fn.jobstart 的命令表
+function M.build_ty_cmd()
+  local env = config.get("env")
+  local host = config.get("host")
+
+  if not host or host == "" then
+    error("build_ty_cmd: 主机名未设置")
+  end
+
+  if not env or env == "" then
+    error("build_ty_cmd: 虚拟环境路径未设置")
+  end
+
+  local env_bin = string.format("%s/bin", env)
+  local ty_bin = string.format([[%s/ty]], env_bin)
+
+  -- 构建远程执行的 shell 脚本，设置 VIRTUAL_ENV 让 ty 发现第三方库
+  local cmd_str = string.format(
+    [[
+TY_BIN="%s"
+export VIRTUAL_ENV="%s"
+export PATH="%s:$PATH"
+if [ -x "$TY_BIN" ]; then
+  exec "$TY_BIN" server
+else
+  echo "ty executable not found under %s" >&2
+  exit 127
+fi]],
+    ty_bin,
+    env,
+    env_bin,
+    env_bin
+  )
+
+  return { "ssh", host, cmd_str }
+end
+
+-----------------------------------------------------------------------
 -- M.execute_remote_script(script, cb, opts)
 -- 功能：便捷函数：执行远程脚本
 -- 参数：
