@@ -75,31 +75,29 @@ function M.prompt_env_path_async(cb, opts)
   -- 检查是否有配置的环境
   local current_env = config.get("env")
   if not current_env or current_env == "" then
-    -- 显示环境选择界面
     local host = config.get("host")
     local envs = state.list_envs(host)
-    if #envs > 0 then
+    if #envs == 1 then
+      -- 只有一个环境时自动使用，直接返回不阻塞UI
+      config.set({ env = envs[1] })
+      cb(envs[1] .. "/bin/python")
+    elseif #envs > 1 then
+      -- 多个环境时让用户选择，但由于prompted_env已置位，本session只会出现一次
       M.select_env_async(host, function(choice)
         if choice and choice ~= "" then
           config.set({ env = choice })
+          cb(choice .. "/bin/python")
+        else
+          cb(nil)
         end
-
-        local updated_env = config.get("env")
-        if not updated_env or updated_env == "" then
-          local input_env = vim.fn.input("Remote virtualenv root (without /bin/python): ")
-          input_env = vim.fn.trim(input_env)
-          if input_env ~= nil and input_env ~= "" then
-            config.set({ env = input_env })
-          end
-        end
-        ask_python()
       end)
     else
       -- 没有历史记录，直接询问
       ask_python()
     end
   else
-    ask_python()
+    -- 已有配置的环境，直接使用不阻塞UI
+    cb(current_env .. "/bin/python")
   end
 end
 
@@ -585,8 +583,8 @@ function M.ensure_env_and_pyright_async(cb, opts)
 
   -- 检查是否已提示过环境
   if not state.get_prompted_env() then
+    state.set_prompted_env(true)  -- 立即置位，防止重复触发
     M.prompt_env_path_async(function(py_bin)
-      state.set_prompted_env(true)
       if not py_bin or py_bin == "" then
         cb(false)
         return
