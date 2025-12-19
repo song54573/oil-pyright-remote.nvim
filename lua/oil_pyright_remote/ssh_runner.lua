@@ -251,12 +251,15 @@ function M.build_ty_cmd()
   local env_bin = string.format("%s/bin", env)
   local ty_bin = string.format([[%s/ty]], env_bin)
 
-  -- 构建远程执行的 shell 脚本，设置 VIRTUAL_ENV 让 ty 发现第三方库
+  -- 构建远程执行的 shell 脚本，只在venv有效时设置VIRTUAL_ENV
   local cmd_str = string.format(
     [[
 TY_BIN="%s"
-export VIRTUAL_ENV="%s"
+ENV_DIR="%s"
 export PATH="%s:$PATH"
+if [ -f "$ENV_DIR/pyvenv.cfg" ]; then
+  export VIRTUAL_ENV="$ENV_DIR"
+fi
 if [ -x "$TY_BIN" ]; then
   exec "$TY_BIN" server
 else
