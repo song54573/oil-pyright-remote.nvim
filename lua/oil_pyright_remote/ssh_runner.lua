@@ -257,7 +257,7 @@ function M.build_ty_cmd()
 TY_BIN="%s"
 ENV_DIR="%s"
 export PATH="%s:$PATH"
-if [ -f "$ENV_DIR/pyvenv.cfg" ] || [ -d "$ENV_DIR/lib/python"* ]; then
+if [ -f "$ENV_DIR/pyvenv.cfg" ] || [ -d "$ENV_DIR/lib" ]; then
   export VIRTUAL_ENV="$ENV_DIR"
 fi
 if [ -x "$TY_BIN" ]; then
