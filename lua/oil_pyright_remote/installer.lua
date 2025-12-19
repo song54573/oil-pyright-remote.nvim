@@ -360,7 +360,7 @@ exit 1
 PYBIN="%s"
 if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
 "$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
-"$PYBIN" -m pip install --no-user pyright
+"$PYBIN" -m pip install pyright
     ]],
       py_bin
     )
@@ -466,7 +466,7 @@ exit 1
 PYBIN="%s"
 if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
 "$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
-"$PYBIN" -m pip install --no-user ty
+"$PYBIN" -m pip install ty
     ]],
       py_bin
     )
