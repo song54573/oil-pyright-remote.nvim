@@ -311,7 +311,6 @@ PYBIN="%s"
 ENV_BIN="%s"
 "$PYBIN" -V >/dev/null 2>&1 || exit 2
 if [ -x "$ENV_BIN/pyright-langserver" ]; then "$ENV_BIN/pyright-langserver" --version >/dev/null 2>&1 && exit 0; fi
-if command -v pyright-langserver >/dev/null 2>&1; then pyright-langserver --version >/dev/null 2>&1 && exit 0; fi
 "$PYBIN" -m pip show pyright >/dev/null 2>&1 && exit 0
 "$PYBIN" -m pyright.langserver --version >/dev/null 2>&1 && exit 0
 exit 1
@@ -419,7 +418,8 @@ function M.ensure_ty_installed_async(py_bin, cb, opts)
 PYBIN="%s"
 ENV_BIN="%s"
 "$PYBIN" -V >/dev/null 2>&1 || exit 2
-if [ -x "$ENV_BIN/ty" ]; then "$ENV_BIN/ty" --version >/dev/null 2>&1 && exit 0; fi
+if [ -x "$ENV_BIN/ty" ]; then "$ENV_BIN/ty" server --help >/dev/null 2>&1 && exit 0; fi
+"$PYBIN" -m pip show ty >/dev/null 2>&1 && exit 0
 exit 1
 ]],
       py_bin,
@@ -633,7 +633,7 @@ function M.ensure_env_and_pyright_async(cb, opts)
               ),
               vim.log.levels.ERROR
             )
-            local cache_key = string.format("%s|%s:missing", host, config.get("env") or "")
+            local cache_key = string.format("%s|%s|%s:missing", backend, host, config.get("env") or "")
             state.set_checked_env(cache_key)
             cb(false)
             return
@@ -664,7 +664,7 @@ function M.ensure_env_and_pyright_async(cb, opts)
         ),
         vim.log.levels.ERROR
       )
-      local cache_key = string.format("%s|%s:missing", host, env or "")
+      local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
       state.set_checked_env(cache_key)
       cb(false)
     end

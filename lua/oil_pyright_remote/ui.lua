@@ -145,7 +145,7 @@ function M.show_status()
   local host = cfg.host
   local env = cfg.env
   if host and host ~= "" and env and env ~= "" then
-    local valid = state.has_valid_env(host, env)
+    local valid = state.has_valid_env(cfg.backend .. ":" .. host, env)
     table.insert(status_lines, string.format("  Environment validated: %s", tostring(valid)))
   end
 

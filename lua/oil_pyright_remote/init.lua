@@ -106,7 +106,7 @@ function M.get_status()
     initialized = initialized,
     has_valid_env = function()
       local cfg = config.get()
-      return state.has_valid_env(cfg.host, cfg.env)
+      return state.has_valid_env(cfg.backend .. ":" .. cfg.host, cfg.env)
     end,
   }
 end
