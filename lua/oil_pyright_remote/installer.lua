@@ -290,23 +290,14 @@ function M.cleanup_floating_window()
 end
 
 -----------------------------------------------------------------------
--- M.ensure_pyright_installed_async(py_bin, cb, opts)
--- 功能：确保 pyright 已安装
--- 参数：
---   py_bin - python 路径
---   cb     - 回调函数 cb(success, declined)
---   opts   - 选项：
---            quiet: 是否静默执行
--- 返回：无
-function M.ensure_pyright_installed_async(py_bin, cb, opts)
-  opts = opts or {}
-  local quiet = opts.quiet == true
-  local env = config.get("env")
-
-  local function run_check_async(next_cb)
-    local env_bin = env .. "/bin"
-    local script = string.format(
-      [[
+-- Backend Registry
+-----------------------------------------------------------------------
+local BACKENDS = {
+  pyright = {
+    package = "pyright",
+    binary = "pyright-langserver",
+    check_script = function(py_bin, env_bin)
+      return string.format([[
 PYBIN="%s"
 ENV_BIN="%s"
 "$PYBIN" -V >/dev/null 2>&1 || exit 2
@@ -314,11 +305,44 @@ if [ -x "$ENV_BIN/pyright-langserver" ]; then "$ENV_BIN/pyright-langserver" --ve
 "$PYBIN" -m pip show pyright >/dev/null 2>&1 && exit 0
 "$PYBIN" -m pyright.langserver --version >/dev/null 2>&1 && exit 0
 exit 1
-]],
-      py_bin,
-      env_bin
-    )
+]], py_bin, env_bin)
+    end,
+  },
+  ty = {
+    package = "ty",
+    binary = "ty",
+    check_script = function(py_bin, env_bin)
+      return string.format([[
+PYBIN="%s"
+ENV_BIN="%s"
+"$PYBIN" -V >/dev/null 2>&1 || exit 2
+if [ -x "$ENV_BIN/ty" ]; then "$ENV_BIN/ty" server --help >/dev/null 2>&1 && exit 0; fi
+"$PYBIN" -m pip show ty >/dev/null 2>&1 && exit 0
+exit 1
+]], py_bin, env_bin)
+    end,
+  },
+}
 
+-----------------------------------------------------------------------
+-- ensure_backend_installed_async(backend_name, py_bin, cb, opts)
+-- 功能：通用的backend安装检查和安装函数
+-----------------------------------------------------------------------
+local function ensure_backend_installed_async(backend_name, py_bin, cb, opts)
+  opts = opts or {}
+  local quiet = opts.quiet == true
+  local env = config.get("env")
+  local backend_cfg = BACKENDS[backend_name]
+
+  if not backend_cfg then
+    notify(string.format("[installer] unknown backend: %s", backend_name), vim.log.levels.ERROR)
+    cb(false, false)
+    return
+  end
+
+  local function run_check_async(next_cb)
+    local env_bin = env .. "/bin"
+    local script = backend_cfg.check_script(py_bin, env_bin)
     ssh_runner.execute_remote_script(script, function(ok, out, code)
       state.set_last_check_out(out)
       next_cb(ok, out, code)
@@ -332,7 +356,7 @@ exit 1
     end
 
     notify(
-      string.format("[installer] pyright not found (code=%d). Output:\n%s", code, table.concat(out or {}, "\n")),
+      string.format("[installer] %s not found (code=%d). Output:\n%s", backend_name, code, table.concat(out or {}, "\n")),
       vim.log.levels.WARN,
       quiet
     )
@@ -341,47 +365,43 @@ exit 1
     local proceed_install = auto_install
 
     if not proceed_install then
-      local ans = vim.fn.input("Pyright not detected in remote env. Install via pip? [y/N]: ")
+      local ans = vim.fn.input(string.format("%s not detected in remote env. Install via pip? [y/N]: ", backend_cfg.package))
       proceed_install = ans:lower() == "y"
     else
-      notify(string.format("[installer] auto-installing pyright ... (%s)", env), vim.log.levels.INFO, quiet)
+      notify(string.format("[installer] auto-installing %s ... (%s)", backend_name, env), vim.log.levels.INFO, quiet)
     end
 
     if not proceed_install then
-      notify("[installer] skipping pyright install; LSP may fail to start", vim.log.levels.WARN, quiet)
+      notify(string.format("[installer] skipping %s install; LSP may fail to start", backend_name), vim.log.levels.WARN, quiet)
       cb(false, true)
       return
     end
 
-    -- 执行安装
-    local install_script = string.format(
-      [[
+    local install_script = string.format([[
 PYBIN="%s"
 if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
 "$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
-"$PYBIN" -m pip install pyright
-    ]],
-      py_bin
-    )
+"$PYBIN" -m pip install %s
+]], py_bin, backend_cfg.package)
 
     ssh_runner.execute_remote_script(install_script, function(ok2, output, code2)
       if not ok2 then
         notify(
-          "[installer] pip install pyright failed: " .. table.concat(output or {}, "\n"),
+          string.format("[installer] pip install %s failed: %s", backend_name, table.concat(output or {}, "\n")),
           vim.log.levels.ERROR
         )
         cb(false, false)
         return
       end
 
-      notify("[installer] pip install output:\n" .. table.concat(output or {}, "\n"), vim.log.levels.INFO, quiet)
+      notify(string.format("[installer] pip install output:\n%s", table.concat(output or {}, "\n")), vim.log.levels.INFO, quiet)
 
-      -- 再次检查是否安装成功
       run_check_async(function(ok3, out3, code3)
         if not ok3 then
           notify(
             string.format(
-              "[installer] pyright still missing after install (code=%d). Output:\n%s",
+              "[installer] %s still missing after install (code=%d). Output:\n%s",
+              backend_name,
               code3,
               table.concat(out3 or {}, "\n")
             ),
@@ -390,11 +410,24 @@ if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; e
           cb(false, false)
           return
         end
-        notify("[installer] pyright installed and validated", vim.log.levels.INFO, quiet)
+        notify(string.format("[installer] %s installed and validated", backend_name), vim.log.levels.INFO, quiet)
         cb(true, false)
       end)
-    end, { timeout = 120000 }) -- 安装可能需要更长时间
+    end, { timeout = 120000 })
   end)
+end
+
+-----------------------------------------------------------------------
+-- M.ensure_pyright_installed_async(py_bin, cb, opts)
+-- 功能：确保 pyright 已安装
+-- 参数：
+--   py_bin - python 路径
+--   cb     - 回调函数 cb(success, declined)
+--   opts   - 选项：
+--            quiet: 是否静默执行
+-- 返回：无
+function M.ensure_pyright_installed_async(py_bin, cb, opts)
+  ensure_backend_installed_async("pyright", py_bin, cb, opts)
 end
 
 -----------------------------------------------------------------------
@@ -407,101 +440,7 @@ end
 --            quiet: 是否静默执行
 -- 返回：无
 function M.ensure_ty_installed_async(py_bin, cb, opts)
-  opts = opts or {}
-  local quiet = opts.quiet == true
-  local env = config.get("env")
-
-  local function run_check_async(next_cb)
-    local env_bin = env .. "/bin"
-    local script = string.format(
-      [[
-PYBIN="%s"
-ENV_BIN="%s"
-"$PYBIN" -V >/dev/null 2>&1 || exit 2
-if [ -x "$ENV_BIN/ty" ]; then "$ENV_BIN/ty" server --help >/dev/null 2>&1 && exit 0; fi
-"$PYBIN" -m pip show ty >/dev/null 2>&1 && exit 0
-exit 1
-]],
-      py_bin,
-      env_bin
-    )
-
-    ssh_runner.execute_remote_script(script, function(ok, out, code)
-      state.set_last_check_out(out)
-      next_cb(ok, out, code)
-    end, { timeout = 15000, quiet = quiet })
-  end
-
-  run_check_async(function(ok, out, code)
-    if ok then
-      cb(true, false)
-      return
-    end
-
-    notify(
-      string.format("[installer] ty not found (code=%d). Output:\n%s", code, table.concat(out or {}, "\n")),
-      vim.log.levels.WARN,
-      quiet
-    )
-
-    local auto_install = config.get("auto_install")
-    local proceed_install = auto_install
-
-    if not proceed_install then
-      local ans = vim.fn.input("ty not detected in remote env. Install via pip? [y/N]: ")
-      proceed_install = ans:lower() == "y"
-    else
-      notify(string.format("[installer] auto-installing ty ... (%s)", env), vim.log.levels.INFO, quiet)
-    end
-
-    if not proceed_install then
-      notify("[installer] skipping ty install; LSP may fail to start", vim.log.levels.WARN, quiet)
-      cb(false, true)
-      return
-    end
-
-    -- 执行安装
-    local install_script = string.format(
-      [[
-PYBIN="%s"
-if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
-"$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
-"$PYBIN" -m pip install ty
-    ]],
-      py_bin
-    )
-
-    ssh_runner.execute_remote_script(install_script, function(ok2, output, code2)
-      if not ok2 then
-        notify(
-          "[installer] pip install ty failed: " .. table.concat(output or {}, "\n"),
-          vim.log.levels.ERROR
-        )
-        cb(false, false)
-        return
-      end
-
-      notify("[installer] pip install output:\n" .. table.concat(output or {}, "\n"), vim.log.levels.INFO, quiet)
-
-      -- 再次检查是否安装成功
-      run_check_async(function(ok3, out3, code3)
-        if not ok3 then
-          notify(
-            string.format(
-              "[installer] ty still missing after install (code=%d). Output:\n%s",
-              code3,
-              table.concat(out3 or {}, "\n")
-            ),
-            vim.log.levels.ERROR
-          )
-          cb(false, false)
-          return
-        end
-        notify("[installer] ty installed and validated", vim.log.levels.INFO, quiet)
-        cb(true, false)
-      end)
-    end, { timeout = 120000 })
-  end)
+  ensure_backend_installed_async("ty", py_bin, cb, opts)
 end
 
 -----------------------------------------------------------------------
