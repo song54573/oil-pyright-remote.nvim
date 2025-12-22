@@ -291,9 +291,58 @@ function M.build_config(bufnr)
 end
 
 -----------------------------------------------------------------------
+-- M.stop_client_force(client_id, timeout_ms)
+-- 功能：强制停止 LSP 客户端（先尝试正常停止，超时后强制终止）
+-- 参数：
+--   client_id  - 客户端 ID
+--   timeout_ms - 超时时间（毫秒），默认 3000
+-- 说明：
+--   - 系统休眠/网络断开后，vim.lsp.stop_client 可能无法正常终止进程
+--   - 此函数确保客户端被彻底清理，避免僵尸进程和内存泄漏
+-----------------------------------------------------------------------
+function M.stop_client_force(client_id, timeout_ms)
+  timeout_ms = timeout_ms or 3000
+
+  if not client_id or client_id <= 0 then
+    return
+  end
+
+  local client = vim.lsp.get_client_by_id(client_id)
+  if not client then
+    return
+  end
+
+  -- 清理诊断信息
+  diagnostics.cleanup_client(client_id)
+
+  -- 尝试正常停止
+  vim.lsp.stop_client(client_id, false)
+
+  -- 等待客户端退出，超时后强制终止
+  vim.defer_fn(function()
+    local still_alive = vim.lsp.get_client_by_id(client_id)
+    if still_alive then
+      -- 客户端仍然存活，强制停止
+      vim.lsp.stop_client(client_id, true)
+
+      -- 如果有 RPC 进程，尝试强杀
+      if still_alive.rpc and still_alive.rpc.pid then
+        local uv = vim.uv or vim.loop
+        if uv and uv.kill then
+          pcall(uv.kill, still_alive.rpc.pid, "sigkill")
+        end
+      end
+    end
+  end, timeout_ms)
+end
+
+-----------------------------------------------------------------------
 -- M.enable_pyright_remote(bufnr)
 -- 功能：为指定缓冲区启用 pyright_remote
 -- 参数：bufnr - 缓冲区编号，可选
+-- 说明：
+--   - 实现客户端复用：相同 host+root 的缓冲区共享同一个客户端
+--   - 避免重复创建导致资源累积和内存泄漏
 function M.enable_pyright_remote(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
 
@@ -306,12 +355,6 @@ function M.enable_pyright_remote(bufnr)
   state.set_reconnect_last_buf(bufnr)
   state.stop_reconnect_timer()
 
-  -- 检查是否已有客户端
-  local existing = M.get_clients({ bufnr = bufnr, name = "pyright_remote" })
-  if existing and #existing > 0 then
-    return
-  end
-
   -- 从缓冲区名称提取主机信息
   local name = vim.api.nvim_buf_get_name(bufnr)
   local h = get_oil_ssh_host_from_bufname(name)
@@ -319,9 +362,28 @@ function M.enable_pyright_remote(bufnr)
     config.set({ host = h })
   end
 
-  local function start_client()
-    local cfg = M.build_config(bufnr)
+  -- 构建配置以获取 root_dir
+  local cfg = M.build_config(bufnr)
+  local target_root = cfg.root_dir
+  local target_host = config.get("host")
 
+  -- 检查是否已有可复用的客户端（相同 host + root）
+  local existing_clients = M.get_clients({ name = "pyright_remote" })
+  for _, client in ipairs(existing_clients) do
+    local client_root = client.config.root_dir
+    local client_host = client.config._pyright_remote_host
+
+    if client_root == target_root and client_host == target_host then
+      -- 找到可复用的客户端，直接附着
+      if not vim.lsp.buf_is_attached(bufnr, client.id) then
+        vim.lsp.buf_attach_client(bufnr, client.id)
+      end
+      return
+    end
+  end
+
+  -- 没有可复用的客户端，创建新的
+  local function start_client()
     -- 启动通知
     if config.get("start_notify") then
       vim.schedule(function()

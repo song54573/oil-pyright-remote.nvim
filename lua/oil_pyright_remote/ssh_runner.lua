@@ -7,6 +7,40 @@ local M = {}
 -- 依赖模块
 local config = require("oil_pyright_remote.config")
 local state = require("oil_pyright_remote.state")
+local uv = vim.uv or vim.loop
+
+-----------------------------------------------------------------------
+-- SSH 连接参数（用于避免断网/休眠时 SSH 无期限挂起）
+-- 说明：
+--   1) BatchMode=yes 禁止交互式密码提示，避免卡死。
+--   2) ConnectTimeout 控制初次连接超时。
+--   3) ServerAliveInterval/CountMax 让断线能被检测并退出。
+--   4) TCPKeepAlive 作为更底层的保活补充。
+-----------------------------------------------------------------------
+local DEFAULT_SSH_OPTS = {
+  "-o", "BatchMode=yes",
+  "-o", "ConnectTimeout=10",
+  "-o", "ServerAliveInterval=10",
+  "-o", "ServerAliveCountMax=3",
+  "-o", "TCPKeepAlive=yes",
+}
+
+-----------------------------------------------------------------------
+-- build_ssh_cmd(host, script)
+-- 功能：统一构建 SSH 命令（带默认保活/超时参数）
+-- 参数：
+--   host   - 远程主机名
+--   script - 远程执行脚本（单参数形式）
+-- 返回：适合 vim.fn.jobstart 的命令表
+-----------------------------------------------------------------------
+local function build_ssh_cmd(host, script)
+  local cmd = { "ssh" }
+  -- 使用默认参数，避免断网时 ssh 卡死导致 job 无法退出
+  vim.list_extend(cmd, DEFAULT_SSH_OPTS)
+  table.insert(cmd, host)
+  table.insert(cmd, script)
+  return cmd
+end
 
 -----------------------------------------------------------------------
 -- M.remote_bash(script)
@@ -23,7 +57,7 @@ function M.remote_bash(script)
     error("remote_bash: script 必须是非空字符串")
   end
 
-  return { "ssh", host, script }
+  return build_ssh_cmd(host, script)
 end
 
 -----------------------------------------------------------------------
@@ -40,6 +74,8 @@ function M.run_async(cmd, cb, opts)
   opts = opts or {}
   local timeout = opts.timeout or 300000
   local quiet = opts.quiet == true
+  local max_output_lines = opts.max_output_lines or 2000
+  local kill_grace_ms = opts.kill_grace_ms or 1500
 
   if type(cmd) ~= "table" or #cmd == 0 then
     error("run_async: cmd 必须是非空表")
@@ -53,6 +89,26 @@ function M.run_async(cmd, cb, opts)
   local job_timer = nil
   local job_id = nil
   local finished = false -- 用于保证 cb 只会被调用一次（超时与 on_exit 可能竞争）
+
+  ---------------------------------------------------------------------
+  -- 输出收集辅助函数
+  -- 设计目标：
+  --   1) 输出量有上限，避免长日志/卡住时内存持续膨胀
+  --   2) 超时后立即停止追加，避免"已经回调了还在涨内存"
+  ---------------------------------------------------------------------
+  local function push_line(target, line)
+    if finished or not line or line == "" then
+      return
+    end
+    if max_output_lines > 0 and #target >= max_output_lines then
+      -- 只追加一次"截断提示"，避免无限增长
+      if #target == max_output_lines then
+        table.insert(target, "...（输出已截断）")
+      end
+      return
+    end
+    table.insert(target, line)
+  end
 
   ---------------------------------------------------------------------
   -- 为什么要用 finished 标记？
@@ -75,15 +131,34 @@ function M.run_async(cmd, cb, opts)
       job_timer = nil
     end
 
-    cb(success, stdout, code, signal, final_stderr or stderr)
+    -- 为了尽快释放内存，先保存输出引用，再断开本地引用
+    local out = stdout
+    local err = final_stderr or stderr
+    stdout, stderr = nil, nil
+    cb(success, out, code, signal, err)
   end
 
   -- 统一在安全上下文停止 job，避免在 libuv timer 回调（fast event）里直接调用 vim.fn
+  local function force_kill_job()
+    -- jobstop 失败时做最后兜底：通过 PID 强杀
+    local pid = vim.fn.jobpid(job_id)
+    if pid and pid > 0 and uv and uv.kill then
+      pcall(uv.kill, pid, "sigkill")
+    end
+  end
+
   local function stop_job_safely()
     if not job_id or job_id <= 0 then
       return
     end
     pcall(vim.fn.jobstop, job_id)
+    -- 给予短暂宽限期；若仍未退出则强杀，避免僵尸进程
+    if kill_grace_ms and kill_grace_ms > 0 then
+      local waited = vim.fn.jobwait({ job_id }, kill_grace_ms)[1]
+      if waited == -1 then
+        force_kill_job()
+      end
+    end
   end
 
   -- 超时处理：在主线程上下文执行 stop_job + 回调，确保稳定
@@ -122,18 +197,14 @@ function M.run_async(cmd, cb, opts)
     on_stdout = function(_, data)
       if data then
         for _, line in ipairs(data) do
-          if line ~= "" then
-            table.insert(stdout, line)
-          end
+          push_line(stdout, line)
         end
       end
     end,
     on_stderr = function(_, data)
       if data then
         for _, line in ipairs(data) do
-          if line ~= "" then
-            table.insert(stderr, line)
-          end
+          push_line(stderr, line)
         end
       end
     end,
@@ -229,7 +300,7 @@ fi]],
     env_bin
   )
 
-  return { "ssh", host, cmd_str }
+  return build_ssh_cmd(host, cmd_str)
 end
 
 -----------------------------------------------------------------------
@@ -272,7 +343,7 @@ fi]],
     env_bin
   )
 
-  return { "ssh", host, cmd_str }
+  return build_ssh_cmd(host, cmd_str)
 end
 
 -----------------------------------------------------------------------

@@ -13,10 +13,13 @@ local initialized = false
 local handlers = {}
 local diagnostic_config = nil
 
--- 已知的“pyright_remote 诊断命名空间”集合（key=ns, value=true）
+-- 已知的"pyright_remote 诊断命名空间"集合（key=ns, value=true）
 -- 用途：当用户执行 :DiagVirtualTextOn/Off 等命令时，我们可以仅更新本插件相关的命名空间配置，
 -- 避免误改其他 LSP/文件类型的诊断显示。
 local diagnostic_namespaces = {}
+
+-- 记录 client_id -> namespace，便于退出时清理
+local diagnostic_ns_by_client = {}
 
 -----------------------------------------------------------------------
 -- build_diagnostic_config(user_cfg)
@@ -93,10 +96,11 @@ function M.apply_on_attach(client, bufnr)
     return
   end
 
-  -- 只在“本 client 的诊断命名空间”上配置，避免污染全局诊断显示
+  -- 只在"本 client 的诊断命名空间"上配置，避免污染全局诊断显示
   local ns = get_client_diagnostic_namespace(client)
   if ns then
     diagnostic_namespaces[ns] = true
+    diagnostic_ns_by_client[client.id] = ns
   end
 
   -- 如果 setup 尚未执行（理论上不应发生），兜底用默认配置
@@ -155,6 +159,26 @@ function M.create_toggle_commands()
   vim.api.nvim_create_user_command("DiagVirtualTextToggle", function()
     M.toggle_virtual_text()
   end, { nargs = 0 })
+end
+
+-----------------------------------------------------------------------
+-- M.cleanup_client(client_id)
+-- 功能：清理某个客户端对应的诊断 namespace
+-- 说明：
+--   - 断网/重连会创建新 client，旧 namespace 若不清理会积累诊断数据。
+--   - 这里主动 reset，释放内存并避免重复诊断叠加。
+-----------------------------------------------------------------------
+function M.cleanup_client(client_id)
+  if not client_id then
+    return
+  end
+  local ns = diagnostic_ns_by_client[client_id]
+  if not ns then
+    return
+  end
+  diagnostic_ns_by_client[client_id] = nil
+  diagnostic_namespaces[ns] = nil
+  pcall(vim.diagnostic.reset, ns)
 end
 
 -----------------------------------------------------------------------
