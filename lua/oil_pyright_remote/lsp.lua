@@ -366,6 +366,11 @@ function M.enable_pyright_remote(bufnr)
   end
 
   local function start_client()
+    -- 防御性检查：缓冲区已被关闭的边缘情况（重连期间用户可能关闭了原文件）
+    if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+      return nil
+    end
+
     local cfg = M.build_config(bufnr)
 
     -- 启动通知
@@ -383,7 +388,12 @@ function M.enable_pyright_remote(bufnr)
       end)
     end
 
-    local client_id = vim.lsp.start(cfg)
+    -- 关键修复：vim.lsp.start() 默认附着到"当前缓冲区"
+    -- 重连定时器触发时用户可能已切换到其他文件（非Python）
+    -- 使用 nvim_buf_call 临时切换上下文到目标 bufnr，避免误附着
+    local client_id = vim.api.nvim_buf_call(bufnr, function()
+      return vim.lsp.start(cfg)
+    end)
     if client_id then
       state.reset_reconnect_attempted()
     end
