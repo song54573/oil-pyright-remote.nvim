@@ -322,23 +322,18 @@ function M.build_ty_cmd()
   local env_bin = string.format("%s/bin", env)
   local ty_bin = string.format([[%s/ty]], env_bin)
 
-  -- 构建远程执行的 shell 脚本，检查venv有效性后设置VIRTUAL_ENV
+  -- 构建远程执行的 shell 脚本，仅在确认是完整 venv 时设置 VIRTUAL_ENV
   local cmd_str = string.format(
     [[
 TY_BIN="%s"
 ENV_DIR="%s"
 export PATH="%s:$PATH"
-# 先用 pyvenv.cfg 识别 venv；否则再兼容 virtualenv 的 lib/pythonX.Y 结构
-# 注意：不能只检查 lib 目录，否则会把非 venv 目录误判为虚拟环境
+# 仅当存在 pyvenv.cfg 时才设置 VIRTUAL_ENV，避免 ty 报错
+# 对于缺少 pyvenv.cfg 的环境，ty 会回退到默认设置
 if [ -f "$ENV_DIR/pyvenv.cfg" ]; then
   export VIRTUAL_ENV="$ENV_DIR"
 else
-  for d in "$ENV_DIR"/lib/python*; do
-    if [ -d "$d" ]; then
-      export VIRTUAL_ENV="$ENV_DIR"
-      break
-    fi
-  done
+  unset VIRTUAL_ENV
 fi
 if [ -x "$TY_BIN" ]; then
   exec "$TY_BIN" server
