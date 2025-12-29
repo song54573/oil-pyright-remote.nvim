@@ -328,8 +328,17 @@ function M.build_ty_cmd()
 TY_BIN="%s"
 ENV_DIR="%s"
 export PATH="%s:$PATH"
-if [ -f "$ENV_DIR/pyvenv.cfg" ] || [ -d "$ENV_DIR/lib" ]; then
+# 先用 pyvenv.cfg 识别 venv；否则再兼容 virtualenv 的 lib/pythonX.Y 结构
+# 注意：不能只检查 lib 目录，否则会把非 venv 目录误判为虚拟环境
+if [ -f "$ENV_DIR/pyvenv.cfg" ]; then
   export VIRTUAL_ENV="$ENV_DIR"
+else
+  for d in "$ENV_DIR"/lib/python*; do
+    if [ -d "$d" ]; then
+      export VIRTUAL_ENV="$ENV_DIR"
+      break
+    fi
+  done
 fi
 if [ -x "$TY_BIN" ]; then
   exec "$TY_BIN" server
