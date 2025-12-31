@@ -51,10 +51,18 @@ local backend_strategies = {
     -- ty 的配置结构：settings.ty.*
     -- 参考: https://docs.astral.sh/ty/reference/editor-settings/
     local ty_settings = vim.tbl_deep_extend("force", {
+      -- 【关键】不要禁用语言服务，否则诊断不工作
+      disableLanguageServices = false,
       -- 诊断模式：远程 SSH 场景推荐 openFilesOnly 以提升性能
       diagnosticMode = "openFilesOnly",  -- "off" | "workspace" | "openFilesOnly"
       -- 显示语法错误诊断（关键配置）
       showSyntaxErrors = true,
+      -- 【关键】规则配置：确保 invalid-syntax 不是 ignore
+      configuration = {
+        rules = {
+          ["invalid-syntax"] = "error",  -- 语法错误显示为 error
+        },
+      },
       -- 内联类型提示
       inlayHints = {
         variableTypes = true,
@@ -557,6 +565,16 @@ function M.setup(capabilities_override)
   capabilities = vim.lsp.protocol.make_client_capabilities()
   capabilities.workspace = capabilities.workspace or {}
   capabilities.workspace.didChangeWatchedFiles = { dynamicRegistration = false }
+
+  -- 添加 workspace diagnostic capability（ty LSP 0.0.8 需要）
+  capabilities.workspace.diagnostic = {
+    dynamicRegistration = false,
+    relatedDocumentSupport = false,
+  }
+
+  -- 禁用 pull diagnostics，强制 ty 使用 publishDiagnostics (push model)
+  -- ty LSP 0.0.8 的 pull diagnostics 实现可能有 bug
+  capabilities.textDocument.diagnostic = nil
 
   -- 应用能力覆盖
   if capabilities_override then
