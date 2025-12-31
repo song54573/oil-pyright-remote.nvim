@@ -20,6 +20,56 @@ local capabilities = nil
 local SUPPORTED_FILETYPES = { "python" }
 
 -----------------------------------------------------------------------
+-- 后端策略：不同 LSP 后端的配置生成策略
+-- 说明：
+--   - pyright: 使用 settings.python.analysis 配置格式
+--   - ty: 使用 LSP initializationOptions 配置格式
+--   每个策略返回：{ cmd, settings?, init_options? }
+-----------------------------------------------------------------------
+local backend_strategies = {
+  pyright = function(env_path)
+    local user_opts = config.get("lsp_opts") or {}
+    return {
+      cmd = ssh_runner.build_pyright_cmd(),
+      settings = {
+        python = {
+          analysis = vim.tbl_deep_extend("force", {
+            typeCheckingMode = "basic",
+            autoSearchPaths = true,
+            useLibraryCodeForTypes = true,
+            autoImportCompletions = true,
+          }, user_opts),
+          pythonPath = env_path .. "/bin/python",
+        },
+      },
+    }
+  end,
+
+  ty = function(env_path)
+    local user_opts = config.get("lsp_opts") or {}
+
+    -- ty 的配置结构：settings.ty.*
+    local ty_settings = vim.tbl_deep_extend("force", {
+      -- 默认配置：确保显示语法错误和完整诊断
+      diagnosticMode = "workspace",  -- "off" | "workspace" | "openFilesOnly"
+      showSyntaxErrors = true,       -- 关键：启用语法错误诊断
+    }, user_opts)
+
+    return {
+      cmd = ssh_runner.build_ty_cmd(),
+      -- ty 使用 settings.ty.* 接收配置（不是 init_options）
+      settings = {
+        ty = ty_settings,
+      },
+      -- init_options 仅用于 logFile 和 logLevel
+      init_options = {
+        logLevel = "info",  -- "trace" | "debug" | "info" | "warn" | "error"
+      },
+    }
+  end,
+}
+
+-----------------------------------------------------------------------
 -- 远程缓冲区判定（本插件只服务 oil-ssh:// 远程文件）
 -- 说明：
 --   - 本插件的 LSP 进程运行在远程主机，通过 ssh 传输 stdio
@@ -258,6 +308,12 @@ function M.build_config(bufnr)
     },
   }
 
+  -- 获取后端特定配置（使用策略模式）
+  local backend_name = config.get("backend")
+  local env_path = config.get("env")
+  local strategy = backend_strategies[backend_name] or backend_strategies.pyright
+  local backend_config = strategy(env_path)
+
   -- 合并运行时配置
   cfg = vim.tbl_deep_extend("force", {}, cfg, {
     name = "pyright_remote",
@@ -266,25 +322,20 @@ function M.build_config(bufnr)
     bufnr = bufnr,
     handlers = M.handlers,                  -- 注入自定义处理器，确保诊断 URI 转换生效
     _pyright_remote_host = config.get("host"), -- 将主机信息写入客户端配置，处理器可读取，避免 host 为空导致诊断丢失
-    settings = {
-      python = {
-        analysis = {
-          typeCheckingMode = "basic",
-          autoSearchPaths = true,
-          useLibraryCodeForTypes = true,
-          autoImportCompletions = true,
-        },
-        pythonPath = config.get("env") .. "/bin/python",
-      },
-    },
-  })
+  }, backend_config)
 
-  -- 构建启动命令（根据backend选择）
-  local backend = config.get("backend")
-  if backend == "ty" then
-    cfg.cmd = ssh_runner.build_ty_cmd()
-  else
-    cfg.cmd = ssh_runner.build_pyright_cmd()
+  -- 调试日志：输出完整配置（可通过 vim.g.pyright_remote_debug = true 启用）
+  if vim.g.pyright_remote_debug then
+    vim.notify(
+      string.format(
+        "[pyright_remote] LSP Config Debug:\n  Backend: %s\n  Root: %s\n  Settings: %s\n  Init Options: %s",
+        backend_name,
+        cfg.root_dir,
+        vim.inspect(cfg.settings or {}),
+        vim.inspect(cfg.init_options or {})
+      ),
+      vim.log.levels.INFO
+    )
   end
 
   return cfg
@@ -444,7 +495,7 @@ end
 
 -----------------------------------------------------------------------
 -- M.get_default_config()
--- 功能：获取默认的 pyright_remote 配置
+-- 功能：获取默认的 pyright_remote 配置（通用部分，不包含 backend 特定配置）
 -- 返回：配置表
 function M.get_default_config()
   return {
@@ -475,16 +526,8 @@ function M.get_default_config()
     -- 处理器初始化（默认为空，由 setup 填充）
     handlers = {},
 
-    -- 默认设置
-    settings = {
-      python = {
-        analysis = {
-          typeCheckingMode = "basic",
-          autoSearchPaths = true,
-          useLibraryCodeForTypes = true,
-        },
-      },
-    },
+    -- 注意：settings 和 init_options 由各个 backend 策略提供
+    -- 不在这里设置默认值，避免不同 backend 之间的配置冲突
   }
 end
 
@@ -519,10 +562,14 @@ function M.setup(capabilities_override)
   -- 统一使用 diagnostics 模块的处理器，避免与 init.lua 重复逻辑
   M.handlers = diagnostics.get_handlers(M.jump_with_oil)
 
-  -- 注册 LSP 配置（如果支持）
-  if vim.lsp and vim.lsp.config then
-    vim.lsp.config("pyright_remote", M.get_default_config())
-  end
+  -- 注意：我们使用 vim.lsp.start() 而不是 vim.lsp.enable()
+  -- 因此不需要通过 vim.lsp.config() 注册配置
+  -- 如果未来需要支持 Neovim 0.11+ 的 vim.lsp.enable() 模式，
+  -- 需要在这里根据 backend 动态注册不同的配置
+  --
+  -- if vim.lsp and vim.lsp.config then
+  --   vim.lsp.config("pyright_remote", M.get_default_config())
+  -- end
 
   initialized = true
 

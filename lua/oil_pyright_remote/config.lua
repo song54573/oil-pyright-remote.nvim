@@ -12,6 +12,7 @@ local defaults = {
   auto_install = false,   -- 自动安装 LSP
   start_notify = false,   -- 启动时通知
   auto_prompt = true,     -- 自动提示输入环境路径
+  lsp_opts = {},          -- LSP 后端额外配置（ty: initializationOptions, pyright: settings.python.analysis）
 }
 
 -- 当前配置缓存
@@ -89,7 +90,10 @@ local function normalize_value(key, value)
       error(string.format("无效的 backend 值: %s (必须是 'pyright' 或 'ty')", value))
     end
     return value
-  elseif key == "auto_install" or key == "start_notify" then
+  elseif key == "lsp_opts" and type(value) == "table" then
+    -- lsp_opts 深拷贝，避免引用问题
+    return vim.deepcopy(value)
+  elseif key == "auto_install" or key == "start_notify" or key == "auto_prompt" then
     -- 布尔值处理
     return value == true
   elseif type(value) == "string" then
