@@ -1,5 +1,16 @@
 # Ty Backend 诊断问题调试指南
 
+## 基于深度调研的结论
+
+**重要发现**（来自 Neovim 0.11+ API 和 ty 官方文档调研）：
+
+1. ✅ **配置结构正确**：ty 使用 `settings.ty.*` 接收配置（不是 `init_options`）
+2. ✅ **默认诊断模式**：`openFilesOnly`（不是 `workspace`），适合远程 SSH 场景
+3. ✅ **Root Markers**：应包含 `ty.toml` 以支持 ty 专用配置
+4. ✅ **插件架构**：继续使用 `vim.lsp.start` 手动控制（而非 `vim.lsp.config/enable`）
+
+---
+
 ## 问题现象
 
 使用 `uvx ty check xx.py` 可以看到错误，但通过 LSP 插件使用 ty backend 时看不到诊断。

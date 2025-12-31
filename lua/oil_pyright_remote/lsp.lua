@@ -49,19 +49,31 @@ local backend_strategies = {
     local user_opts = config.get("lsp_opts") or {}
 
     -- ty 的配置结构：settings.ty.*
+    -- 参考: https://docs.astral.sh/ty/reference/editor-settings/
     local ty_settings = vim.tbl_deep_extend("force", {
-      -- 默认配置：确保显示语法错误和完整诊断
-      diagnosticMode = "workspace",  -- "off" | "workspace" | "openFilesOnly"
-      showSyntaxErrors = true,       -- 关键：启用语法错误诊断
+      -- 诊断模式：远程 SSH 场景推荐 openFilesOnly 以提升性能
+      diagnosticMode = "openFilesOnly",  -- "off" | "workspace" | "openFilesOnly"
+      -- 显示语法错误诊断（关键配置）
+      showSyntaxErrors = true,
+      -- 内联类型提示
+      inlayHints = {
+        variableTypes = true,
+        callArgumentNames = true,
+      },
+      -- 补全配置
+      completions = {
+        autoImport = true,
+      },
     }, user_opts)
 
     return {
       cmd = ssh_runner.build_ty_cmd(),
-      -- ty 使用 settings.ty.* 接收配置（不是 init_options）
+      -- ty 使用 settings.ty.* 接收配置
+      -- 参考: https://docs.astral.sh/ty/editors/
       settings = {
         ty = ty_settings,
       },
-      -- init_options 仅用于 logFile 和 logLevel
+      -- init_options 仅用于静态配置（需要重启才能生效）
       init_options = {
         logLevel = "info",  -- "trace" | "debug" | "info" | "warn" | "error"
       },
@@ -504,9 +516,10 @@ function M.get_default_config()
     -- 严格控制文件类型
     filetypes = SUPPORTED_FILETYPES,
 
-    -- 工作区根标记
+    -- 工作区根标记（参考 nvim-lspconfig 的 ty 配置）
     root_markers = {
-      "pyproject.toml",
+      "ty.toml",           -- ty 专用配置文件
+      "pyproject.toml",    -- Python 项目标准
       "setup.py",
       "setup.cfg",
       "requirements.txt",
