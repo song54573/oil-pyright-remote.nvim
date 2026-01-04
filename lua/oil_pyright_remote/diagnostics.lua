@@ -18,7 +18,7 @@ local diagnostic_config = nil
 -- 避免误改其他 LSP/文件类型的诊断显示。
 local diagnostic_namespaces = {}
 
--- 记录 client_id -> namespace，便于退出时清理
+-- 记录 client_id -> { [ns] = true, ... }，便于退出时清理（同时支持 push + pull）
 local diagnostic_ns_by_client = {}
 
 -----------------------------------------------------------------------
@@ -50,17 +50,139 @@ end
 --   Neovim 会为每个 LSP client 分配独立的诊断 namespace。
 --   只有在该 namespace 上配置 vim.diagnostic.config，才能做到“只影响本 client 的诊断显示”。
 -----------------------------------------------------------------------
-local function get_client_diagnostic_namespace(client)
+local function get_client_diagnostic_namespace(client, is_pull)
   if not client or not client.id then
     return nil
   end
 
   -- 兼容不同版本：该函数在 0.8+ 通常可用
   if vim.lsp and vim.lsp.diagnostic and vim.lsp.diagnostic.get_namespace then
-    return vim.lsp.diagnostic.get_namespace(client.id)
+    -- 0.11+ 支持 is_pull 参数；旧版本会忽略额外参数，不影响兼容性
+    local ok, ns = pcall(vim.lsp.diagnostic.get_namespace, client.id, is_pull)
+    if ok then
+      return ns
+    end
+    -- 兜底：尝试旧签名（仅 push）
+    local ok2, ns2 = pcall(vim.lsp.diagnostic.get_namespace, client.id)
+    if ok2 then
+      return ns2
+    end
   end
 
   return nil
+end
+
+-----------------------------------------------------------------------
+-- collect_client_namespaces(client)
+-- 功能：收集某个客户端的诊断命名空间（push + pull），去重后返回列表
+-- 说明：
+--   - Neovim 0.11 引入 pull diagnostics，会使用独立命名空间
+--   - 若只配置 push namespace，pull 诊断会“存在但不显示”
+-----------------------------------------------------------------------
+local function collect_client_namespaces(client)
+  local namespaces = {}
+  local seen = {}
+
+  -- push namespace（传统 publishDiagnostics）
+  local push_ns = get_client_diagnostic_namespace(client, false)
+  if push_ns and not seen[push_ns] then
+    table.insert(namespaces, push_ns)
+    seen[push_ns] = true
+  end
+
+  -- pull namespace（textDocument/diagnostic）
+  local pull_ns = get_client_diagnostic_namespace(client, true)
+  if pull_ns and not seen[pull_ns] then
+    table.insert(namespaces, pull_ns)
+    seen[pull_ns] = true
+  end
+
+  return namespaces
+end
+
+-----------------------------------------------------------------------
+-- register_client_namespaces(client, namespaces)
+-- 功能：登记客户端命名空间，供后续 toggle/cleanup 使用
+-----------------------------------------------------------------------
+local function register_client_namespaces(client, namespaces)
+  if not client or not client.id then
+    return
+  end
+  if type(namespaces) ~= "table" or #namespaces == 0 then
+    return
+  end
+
+  local store = diagnostic_ns_by_client[client.id]
+  if not store then
+    store = {}
+    diagnostic_ns_by_client[client.id] = store
+  end
+
+  for _, ns in ipairs(namespaces) do
+    diagnostic_namespaces[ns] = true
+    store[ns] = true
+  end
+end
+
+-----------------------------------------------------------------------
+-- to_oil_uri_safe(uri, host)
+-- 功能：将 file:// URI 转成 oil-ssh:// URI（安全版）
+-- 说明：
+--   - 若已是 oil-ssh 或非 file:// URI，直接返回原值
+--   - 若 host 缺失，则不做转换，避免抛错
+--   - 该函数绝不抛异常，适合在诊断处理链路中使用
+-----------------------------------------------------------------------
+local function to_oil_uri_safe(uri, host)
+  if type(uri) ~= "string" or uri == "" then
+    return uri
+  end
+  -- 已是 oil-ssh://，直接返回
+  if uri:match("^oil%-ssh://") then
+    return uri
+  end
+  -- 仅处理 file:// URI，其他 scheme 保持原样
+  if not uri:match("^file:") then
+    return uri
+  end
+  if type(host) ~= "string" or host == "" then
+    return uri
+  end
+
+  local fname = vim.uri_to_fname(uri)
+  local ok, oil_uri = pcall(path.to_oil_path, fname, host)
+  if ok then
+    return oil_uri
+  end
+
+  -- 失败则保持原值，避免中断诊断处理
+  return uri
+end
+
+-----------------------------------------------------------------------
+-- rewrite_related_information_uris(diagnostics, host)
+-- 功能：批量修正 diagnostics[].relatedInformation[].location.uri
+-- 说明：
+--   - pull/push 模式都可能带 relatedInformation
+--   - 若不转换，点击跳转会指向本地 file:// 路径
+-----------------------------------------------------------------------
+local function rewrite_related_information_uris(diagnostics, host)
+  if type(diagnostics) ~= "table" then
+    return
+  end
+  for _, d in ipairs(diagnostics) do
+    local rel = d.relatedInformation
+    if rel then
+      for _, info in ipairs(rel) do
+        local loc = info.location
+        if loc and loc.uri then
+          local new_uri = to_oil_uri_safe(loc.uri, host)
+          if new_uri and new_uri ~= loc.uri then
+            loc.uri = new_uri
+          end
+        end
+      end
+    end
+  end
 end
 
 -----------------------------------------------------------------------
@@ -107,21 +229,26 @@ function M.apply_on_attach(client, bufnr)
   end
 
   -- 只在"本 client 的诊断命名空间"上配置，避免污染全局诊断显示
-  local ns = get_client_diagnostic_namespace(client)
-  if ns then
-    diagnostic_namespaces[ns] = true
-    diagnostic_ns_by_client[client.id] = ns
-  end
+  -- 注意：Neovim 0.11 同时存在 push + pull 两套命名空间
+  local namespaces = collect_client_namespaces(client)
+  register_client_namespaces(client, namespaces)
 
   -- 如果 setup 尚未执行（理论上不应发生），兜底用默认配置
   diagnostic_config = diagnostic_config or build_diagnostic_config(nil)
 
   -- 重要：第二个参数传 ns，表示“只对该 namespace 生效”
-  -- 若 ns 为 nil，会退化为全局配置（不推荐），但为了不让诊断完全消失，这里仍做兜底。
-  pcall(vim.diagnostic.config, diagnostic_config, ns)
+  -- 若 ns 不存在（极少数旧版本），退化为全局配置，保证诊断不消失
+  if #namespaces == 0 then
+    pcall(vim.diagnostic.config, diagnostic_config)
+    enable_diagnostics(bufnr, nil)
+    return
+  end
 
-  -- 启用诊断（尽量只启用本 namespace）
-  enable_diagnostics(bufnr, ns)
+  for _, ns in ipairs(namespaces) do
+    pcall(vim.diagnostic.config, diagnostic_config, ns)
+    -- 启用诊断（尽量只启用本 namespace）
+    enable_diagnostics(bufnr, ns)
+  end
 end
 
 -----------------------------------------------------------------------
@@ -182,13 +309,17 @@ function M.cleanup_client(client_id)
   if not client_id then
     return
   end
-  local ns = diagnostic_ns_by_client[client_id]
-  if not ns then
+  local ns_set = diagnostic_ns_by_client[client_id]
+  if not ns_set then
     return
   end
   diagnostic_ns_by_client[client_id] = nil
-  diagnostic_namespaces[ns] = nil
-  pcall(vim.diagnostic.reset, ns)
+
+  -- 逐一清理 push/pull 命名空间
+  for ns, _ in pairs(ns_set) do
+    diagnostic_namespaces[ns] = nil
+    pcall(vim.diagnostic.reset, ns)
+  end
 end
 
 -----------------------------------------------------------------------
@@ -245,46 +376,69 @@ function M.get_publish_diagnostics_handler()
       local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id)
       local host = (client and client.config and client.config._pyright_remote_host) or config.get("host")
 
-      local fname = vim.uri_to_fname(params.uri)
-
-      -- 使用 pcall 包裹转换，避免 host 缺失或路径异常直接抛错导致诊断处理链中断
-      local ok, oil_uri = pcall(path.to_oil_path, fname, host)
-      if ok then
-        params.uri = oil_uri
-      else
-        -- 保留原始 URI，发出警告但不影响后续诊断显示
-        vim.notify(
-          string.format("[diagnostics] URI 转换失败，保持原值: %s -> %s", fname, tostring(oil_uri)),
-          vim.log.levels.WARN
-        )
+      -- 将 file:// URI 转成 oil-ssh://，保证诊断落在正确的缓冲区
+      local new_uri = to_oil_uri_safe(params.uri, host)
+      if new_uri and new_uri ~= params.uri then
+        params.uri = new_uri
       end
 
       -- 处理相关信息的 URI 转换
       if params.diagnostics then
-        for _, d in ipairs(params.diagnostics) do
-          if d.relatedInformation then
-            for _, info in ipairs(d.relatedInformation) do
-              local ri_uri = info.location and info.location.uri
-              if ri_uri then
-                local rf = vim.uri_to_fname(ri_uri)
-                local ok2, oil_ri_uri = pcall(path.to_oil_path, rf, host)
-                if ok2 then
-                  info.location.uri = oil_ri_uri
-                else
-                  vim.notify(
-                    string.format("[diagnostics] 关联 URI 转换失败，保持原值: %s -> %s", rf, tostring(oil_ri_uri)),
-                    vim.log.levels.WARN
-                  )
-                end
-              end
-            end
-          end
-        end
+        rewrite_related_information_uris(params.diagnostics, host)
       end
     end
 
     -- 调用原始处理器
     return vim.lsp.handlers["textDocument/publishDiagnostics"](err, params, ctx, cfg)
+  end
+end
+
+-----------------------------------------------------------------------
+-- M.get_pull_diagnostics_handler()
+-- 功能：获取 textDocument/diagnostic 处理器（pull diagnostics）
+-- 关键点：
+--   - Neovim 0.11 使用 pull 诊断时，会根据 ctx.params.textDocument.uri 定位缓冲区
+--   - 我们发送给服务器的是 file:// URI（远程真实路径），但本地缓冲区是 oil-ssh://
+--   - 若不转换，诊断会写到“本地 file:// 缓冲区”，导致实际 buffer 没有诊断显示
+-----------------------------------------------------------------------
+function M.get_pull_diagnostics_handler()
+  return function(err, result, ctx, cfg)
+    -- 选择默认处理器：优先 handler 表，其次兜底到 vim.lsp.diagnostic
+    local handler = vim.lsp.handlers and vim.lsp.handlers["textDocument/diagnostic"]
+    if not handler and vim.lsp and vim.lsp.diagnostic and vim.lsp.diagnostic.on_diagnostic then
+      handler = vim.lsp.diagnostic.on_diagnostic
+    end
+    if not handler then
+      return
+    end
+
+    -- 尝试获取 host，用于 URI 转换
+    local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id)
+    local host = (client and client.config and client.config._pyright_remote_host) or config.get("host")
+
+    -- 默认复用原 ctx；只有在需要修改 URI 时才复制，避免无意义的深拷贝
+    local new_ctx = ctx
+
+    -- 修正 pull 诊断的目标 URI，让诊断落在 oil-ssh 缓冲区
+    if ctx and ctx.params and ctx.params.textDocument and ctx.params.textDocument.uri then
+      local old_uri = ctx.params.textDocument.uri
+      local new_uri = to_oil_uri_safe(old_uri, host)
+      if new_uri and new_uri ~= old_uri then
+        -- 深拷贝 params，避免修改原始 ctx 引发副作用
+        new_ctx = vim.tbl_deep_extend("force", {}, ctx)
+        new_ctx.params = vim.deepcopy(ctx.params)
+        new_ctx.params.textDocument = vim.tbl_deep_extend("force", {}, ctx.params.textDocument)
+        new_ctx.params.textDocument.uri = new_uri
+      end
+    end
+
+    -- 修正 relatedInformation 的 URI，确保跳转也走 oil-ssh
+    if result and result.items then
+      rewrite_related_information_uris(result.items, host)
+    end
+
+    -- 交给 Neovim 默认处理器完成诊断写入
+    return handler(err, result, new_ctx, cfg)
   end
 end
 
@@ -370,6 +524,7 @@ end
 function M.get_handlers(jump_func)
   return {
     ["textDocument/publishDiagnostics"] = M.get_publish_diagnostics_handler(),
+    ["textDocument/diagnostic"] = M.get_pull_diagnostics_handler(),
     ["textDocument/definition"] = M.get_location_handler(jump_func),
     ["textDocument/typeDefinition"] = M.get_location_handler(jump_func),
     ["textDocument/declaration"] = M.get_location_handler(jump_func),
