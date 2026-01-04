@@ -83,7 +83,9 @@ local backend_strategies = {
       },
       -- init_options 仅用于静态配置（需要重启才能生效）
       init_options = {
-        logLevel = "info",  -- "trace" | "debug" | "info" | "warn" | "error"
+        logLevel = "debug",  -- "trace" | "debug" | "info" | "warn" | "error"
+        -- 可选：将 ty server 日志写入文件以便调试
+        -- logFile = vim.fn.stdpath("cache") .. "/ty-server.log",
       },
     }
   end,
