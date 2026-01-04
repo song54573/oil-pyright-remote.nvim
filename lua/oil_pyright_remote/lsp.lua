@@ -51,6 +51,14 @@ local backend_strategies = {
     -- ty 的配置结构：settings.ty.*
     -- 参考: https://docs.astral.sh/ty/reference/editor-settings/
     local ty_settings = vim.tbl_deep_extend("force", {
+      -- 【关键】显式指定 Python 解释器路径：
+      -- 1) 对于 micromamba/conda 环境，通常没有 pyvenv.cfg，
+      --    ty 无法通过 VIRTUAL_ENV 自动识别第三方包路径；
+      -- 2) 明确设置 environment.python，可直接指向已安装依赖的解释器；
+      -- 3) 若用户在 lsp_opts 里自定义 environment，此处会被覆盖（保持可配置性）。
+      environment = {
+        python = env_path .. "/bin/python",
+      },
       -- 【关键】不要禁用语言服务，否则诊断不工作
       disableLanguageServices = false,
       -- 诊断模式：远程 SSH 场景推荐 openFilesOnly 以提升性能
@@ -574,9 +582,12 @@ function M.setup(capabilities_override)
     relatedDocumentSupport = false,
   }
 
-  -- 禁用 pull diagnostics，强制 ty 使用 publishDiagnostics (push model)
-  -- ty LSP 0.0.8 的 pull diagnostics 实现可能有 bug
-  capabilities.textDocument.diagnostic = nil
+  -- 启用 pull diagnostics（ty LSP 0.0.8 通过 pull model 正确返回语法错误诊断）
+  -- 实测证明 ty 的 pull diagnostics 实现完全正常，必须启用才能显示诊断
+  capabilities.textDocument.diagnostic = {
+    dynamicRegistration = false,
+    relatedDocumentSupport = false,
+  }
 
   -- 应用能力覆盖
   if capabilities_override then
