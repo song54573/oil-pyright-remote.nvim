@@ -335,6 +335,16 @@ if [ -f "$ENV_DIR/pyvenv.cfg" ]; then
 else
   unset VIRTUAL_ENV
 fi
+# micromamba/conda 环境识别：存在 conda-meta 目录即可视为有效 conda 环境
+# 目的：让 ty 在非 venv 场景下也能解析第三方包（依赖 CONDA_PREFIX）
+if [ -d "$ENV_DIR/conda-meta" ]; then
+  export CONDA_PREFIX="$ENV_DIR"
+  # 尽量提供环境名，便于日志与后续兼容
+  export CONDA_DEFAULT_ENV="$(basename "$ENV_DIR")"
+else
+  unset CONDA_PREFIX
+  unset CONDA_DEFAULT_ENV
+fi
 if [ -x "$TY_BIN" ]; then
   exec "$TY_BIN" server
 else

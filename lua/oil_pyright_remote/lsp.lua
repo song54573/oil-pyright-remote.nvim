@@ -51,14 +51,6 @@ local backend_strategies = {
     -- ty 的配置结构：settings.ty.*
     -- 参考: https://docs.astral.sh/ty/reference/editor-settings/
     local ty_settings = vim.tbl_deep_extend("force", {
-      -- 【关键】显式指定 Python 解释器路径：
-      -- 1) 对于 micromamba/conda 环境，通常没有 pyvenv.cfg，
-      --    ty 无法通过 VIRTUAL_ENV 自动识别第三方包路径；
-      -- 2) 明确设置 environment.python，可直接指向已安装依赖的解释器；
-      -- 3) 若用户在 lsp_opts 里自定义 environment，此处会被覆盖（保持可配置性）。
-      environment = {
-        python = env_path .. "/bin/python",
-      },
       -- 【关键】不要禁用语言服务，否则诊断不工作
       disableLanguageServices = false,
       -- 诊断模式：远程 SSH 场景推荐 openFilesOnly 以提升性能
