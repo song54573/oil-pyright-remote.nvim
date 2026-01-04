@@ -76,12 +76,22 @@ local function enable_diagnostics(bufnr, namespace)
     return
   end
 
-  -- 新签名：enable(bufnr, namespace)
+  -- 最新签名 (Neovim 0.10+)：enable(true, {bufnr=..., ns_id=...})
+  if pcall(vim.diagnostic.enable, true, { bufnr = bufnr, ns_id = namespace }) then
+    return
+  end
+
+  -- 备选签名 (Neovim 0.10+)：enable({bufnr=..., ns_id=...})
+  if pcall(vim.diagnostic.enable, { bufnr = bufnr, ns_id = namespace }) then
+    return
+  end
+
+  -- 已废弃签名 (Neovim < 0.10，产生警告)：enable(bufnr, namespace)
   if pcall(vim.diagnostic.enable, bufnr, namespace) then
     return
   end
 
-  -- 旧签名：enable(bufnr, { namespace = namespace })
+  -- 最旧签名：enable(bufnr, { namespace = namespace })
   pcall(vim.diagnostic.enable, bufnr, { namespace = namespace })
 end
 
