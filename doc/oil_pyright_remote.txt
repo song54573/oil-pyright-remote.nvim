@@ -1,4 +1,4 @@
-*oil_pyright_remote.txt*    For Neovim >= 0.8.0   Last change: 2026 January 04
+*oil_pyright_remote.txt*    For Neovim >= 0.8.0   Last change: 2026 January 05
 
 ==============================================================================
 Table of Contents                       *oil_pyright_remote-table-of-contents*
