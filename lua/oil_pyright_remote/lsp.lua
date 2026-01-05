@@ -201,20 +201,33 @@ end
 -- 辅助函数：获取 LSP 客户端（兼容不同 Neovim 版本）
 -----------------------------------------------------------------------
 local function get_lsp_clients(opts)
-  if vim.lsp.get_clients then
+  -- 统一 opts 为表，避免后续多次判断 nil，逻辑更清晰
+  opts = opts or {}
+
+  -- 新 API：Neovim 0.10+ 提供 get_clients，支持 name/bufnr 过滤且不会触发弃用提示
+  -- 只要存在就直接使用，保证在新版上不再调用已弃用的 get_active_clients
+  if type(vim.lsp.get_clients) == "function" then
     return vim.lsp.get_clients(opts)
   end
 
-  local clients = {}
-  if not vim.lsp.get_active_clients then
-    return clients
+  -- 旧版兼容：缺少 get_clients 时，退回 get_active_clients 手动过滤
+  -- 这里的过滤逻辑与 get_clients 的行为对齐，保证语义一致
+  local get_active = vim.lsp.get_active_clients
+  if type(get_active) ~= "function" then
+    return {}
   end
 
-  for _, c in ipairs(vim.lsp.get_active_clients()) do
-    local ok_name = (not opts or not opts.name) or (c.name == opts.name)
-    local ok_buf = (not opts or not opts.bufnr) or vim.lsp.buf_is_attached(opts.bufnr, c.id)
+  local clients = {}
+  local want_name = opts.name
+  local want_bufnr = opts.bufnr
+  for _, c in ipairs(get_active()) do
+    -- 过滤规则：
+    -- 1) name 不传则不过滤；传了就必须匹配客户端名称
+    -- 2) bufnr 不传则不过滤；传了就必须已附着到该缓冲区
+    local ok_name = (want_name == nil) or (c.name == want_name)
+    local ok_buf = (want_bufnr == nil) or vim.lsp.buf_is_attached(want_bufnr, c.id)
     if ok_name and ok_buf then
-      table.insert(clients, c)
+      clients[#clients + 1] = c
     end
   end
   return clients
