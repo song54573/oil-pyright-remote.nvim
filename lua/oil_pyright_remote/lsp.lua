@@ -83,7 +83,7 @@ local backend_strategies = {
       },
       -- init_options 仅用于静态配置（需要重启才能生效）
       init_options = {
-        logLevel = "debug",  -- "trace" | "debug" | "info" | "warn" | "error"
+        logLevel = "info",  -- "trace" | "debug" | "info" | "warn" | "error"
         -- 可选：将 ty server 日志写入文件以便调试
         -- logFile = vim.fn.stdpath("cache") .. "/ty-server.log",
       },
@@ -183,6 +183,72 @@ exit 1
     return nil
   end
   return stdout[1]
+end
+
+-----------------------------------------------------------------------
+-- 远程 root_dir 结果缓存（find_remote_root 的调用层缓存）
+-- 设计目标：
+--   1) 只缓存“远程路径 → root_dir”的计算结果，避免重复 SSH 往返
+--   2) 缓存键包含 host/base/markers，确保不同主机/不同起点/不同标记不互相污染
+--   3) 不改变 find_remote_root 的行为，只在调用层做性能优化
+-----------------------------------------------------------------------
+local remote_root_cache = {}
+
+local function build_root_cache_key(host, base, markers)
+  -- 任一关键维度缺失时不做缓存，避免生成不可控的 key
+  if not host or host == "" then
+    return nil
+  end
+  if not base or base == "" then
+    return nil
+  end
+  markers = markers or {}
+
+  -- 用不可见分隔符拼接，减少路径与 marker 发生碰撞的概率
+  return table.concat({ host, base, table.concat(markers, "\0") }, "\n")
+end
+
+local function find_remote_root_cached(base, markers)
+  -- 这里依然通过 config.get("host") 取主机名，保持与 find_remote_root 行为一致
+  local host = config.get("host")
+  local key = build_root_cache_key(host, base, markers)
+  if not key then
+    return find_remote_root(base, markers)
+  end
+
+  local cached = remote_root_cache[key]
+  if cached then
+    return cached
+  end
+
+  local root = find_remote_root(base, markers)
+  -- 只缓存“找到的 root”，避免缓存未命中导致后续无法感知新创建的标记文件
+  if root and root ~= "" then
+    remote_root_cache[key] = root
+  end
+  return root
+end
+
+-----------------------------------------------------------------------
+-- 远程 root_dir 解析（统一构建 root_dir 的逻辑，避免多处重复）
+-- 说明：
+--   - 优先使用用户显式配置的 root
+--   - 若未配置，则在远程侧寻找 root_markers
+--   - 失败时退回到当前文件所在目录
+-----------------------------------------------------------------------
+local function resolve_root_dir_for_buf(bufnr, cfg)
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  local remote_path = path.from_oil_path(bufname) or vim.fn.fnamemodify(bufname, ":p")
+
+  local root_dir = config.get("root")
+  if not root_dir or root_dir == "" then
+    local markers = cfg.root_markers or M.get_default_config().root_markers or {}
+    local base = vim.fn.fnamemodify(remote_path, ":p:h")
+    -- 使用缓存包装的远程 root 探测，减少重复 SSH
+    root_dir = find_remote_root_cached(base, markers) or base
+  end
+
+  return root_dir
 end
 
 -----------------------------------------------------------------------
@@ -322,24 +388,12 @@ function M.build_config(bufnr)
 
   local cfg = vim.deepcopy(M.get_default_config())
 
-  -- 获取缓冲区路径并计算工作区根目录
-  local bufname = vim.api.nvim_buf_get_name(bufnr)
-  local remote_path = path.from_oil_path(bufname) or vim.fn.fnamemodify(bufname, ":p")
-
   -- 远程根目录：优先用户配置，其次远程检测，最后退回文件所在目录
-  local root_dir = config.get("root")
-  if not root_dir or root_dir == "" then
-    local markers = cfg.root_markers or M.get_default_config().root_markers
-    local base = vim.fn.fnamemodify(remote_path, ":p:h")
-    -- 在远程侧检查 root_markers；失败则直接用当前目录
-    root_dir = find_remote_root(base, markers) or base
-  end
-
-  cfg.root_dir = root_dir
+  cfg.root_dir = resolve_root_dir_for_buf(bufnr, cfg)
   cfg.workspace_folders = {
     {
-      uri = vim.uri_from_fname(root_dir),
-      name = root_dir,
+      uri = vim.uri_from_fname(cfg.root_dir),
+      name = cfg.root_dir,
     },
   }
 
@@ -438,9 +492,9 @@ function M.enable_pyright_remote(bufnr)
   state.set_reconnect_last_buf(bufnr)
   state.stop_reconnect_timer()
 
-  -- 检查是否已有客户端
-  local existing = M.get_clients({ bufnr = bufnr, name = "pyright_remote" })
-  if existing and #existing > 0 then
+  -- 若当前缓冲区已附着到 pyright_remote，则无需重复操作
+  local attached = M.get_clients({ bufnr = bufnr, name = "pyright_remote" })
+  if attached and #attached > 0 then
     return
   end
 
@@ -449,6 +503,29 @@ function M.enable_pyright_remote(bufnr)
   local h = get_oil_ssh_host_from_bufname(name)
   if h and h ~= "" then
     config.set({ host = h })
+  end
+
+  -- 计算当前缓冲区的 root_dir（用于复用现有客户端）
+  -- 这里使用统一的 root_dir 解析逻辑，确保与 build_config 保持一致
+  local root_dir = resolve_root_dir_for_buf(bufnr, M.get_default_config())
+  local host = config.get("host")
+
+  -- 显式复用已存在的 pyright_remote 客户端，避免同项目重复启动新进程
+  -- 匹配条件：
+  --   1) root_dir 相同（同一项目）
+  --   2) _pyright_remote_host 相同（同一远程主机）
+  local clients = M.get_clients({ name = "pyright_remote" })
+  for _, c in ipairs(clients) do
+    local c_cfg = c.config or {}
+    if c_cfg.root_dir == root_dir and c_cfg._pyright_remote_host == host then
+      -- 若尚未附着则附着到现有客户端
+      if not vim.lsp.buf_is_attached(bufnr, c.id) then
+        vim.lsp.buf_attach_client(bufnr, c.id)
+      end
+      -- 复用成功后，重置重连标记（避免误触发重连逻辑）
+      state.reset_reconnect_attempted()
+      return
+    end
   end
 
   local function start_client()
