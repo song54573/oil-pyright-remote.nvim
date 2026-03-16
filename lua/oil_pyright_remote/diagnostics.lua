@@ -345,6 +345,26 @@ function M.set_diagnostics_signs(signs_config)
 end
 
 -----------------------------------------------------------------------
+-- jump_diagnostic(count)
+-- 功能：兼容新旧 Neovim 的诊断跳转 API
+-----------------------------------------------------------------------
+local function jump_diagnostic(count)
+  if vim.diagnostic and type(vim.diagnostic.jump) == "function" then
+    vim.diagnostic.jump({ count = count })
+    return
+  end
+
+  if count > 0 and vim.diagnostic and type(vim.diagnostic.goto_next) == "function" then
+    vim.diagnostic.goto_next()
+    return
+  end
+
+  if count < 0 and vim.diagnostic and type(vim.diagnostic.goto_prev) == "function" then
+    vim.diagnostic.goto_prev()
+  end
+end
+
+-----------------------------------------------------------------------
 -- M.open_diagnostic_float()
 -- 功能：打开当前行的诊断浮动窗口
 function M.open_diagnostic_float()
@@ -355,14 +375,14 @@ end
 -- M.goto_next_diagnostic()
 -- 功能：跳转到下一个诊断
 function M.goto_next_diagnostic()
-  vim.diagnostic.goto_next()
+  jump_diagnostic(1)
 end
 
 -----------------------------------------------------------------------
 -- M.goto_prev_diagnostic()
 -- 功能：跳转到上一个诊断
 function M.goto_prev_diagnostic()
-  vim.diagnostic.goto_prev()
+  jump_diagnostic(-1)
 end
 
 -----------------------------------------------------------------------
@@ -582,5 +602,10 @@ end
 function M.get_handler(name)
   return handlers[name]
 end
+
+-- 仅供测试使用的兼容层导出，不属于稳定公开 API。
+M._compat = {
+  jump_diagnostic = jump_diagnostic,
+}
 
 return M

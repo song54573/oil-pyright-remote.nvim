@@ -95,6 +95,34 @@ describe("oil_pyright_remote", function()
     assert.is_false(config.get("auto_prompt"))
   end)
 
+  it("decodes oil-ssh paths before converting to file uris", function()
+    local path = require("oil_pyright_remote.path")
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(bufnr, "oil-ssh://demo-host//remote/project/My%20File.py")
+
+    local uri = path.uri_from_bufnr(bufnr)
+
+    assert.are.equal("file:///remote/project/My%20File.py", uri)
+    assert.is_nil(uri:match("%%25"))
+  end)
+
+  it("keeps fallback behavior for non oil-ssh buffers", function()
+    local path = require("oil_pyright_remote.path")
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    local called = false
+
+    vim.api.nvim_buf_set_name(bufnr, "/tmp/local-file.py")
+
+    local uri = path.uri_from_bufnr(bufnr, function(seen_bufnr)
+      called = true
+      assert.are.equal(bufnr, seen_bufnr)
+      return "file:///tmp/fallback.py"
+    end)
+
+    assert.is_true(called)
+    assert.are.equal("file:///tmp/fallback.py", uri)
+  end)
+
   it("uses vim.diagnostic.jump when available", function()
     local diagnostics = require("oil_pyright_remote.diagnostics")
     local original_jump = vim.diagnostic.jump

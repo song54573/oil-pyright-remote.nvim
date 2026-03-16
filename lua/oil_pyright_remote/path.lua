@@ -156,7 +156,9 @@ function M.uri_from_bufnr(bufnr, orig_uri_from_bufnr)
     if path:sub(1, 2) == "//" then
       path = path:sub(2) -- 消除双斜杠，得到绝对路径
     end
-    return vim.uri_from_fname(path)
+    -- 先解码已编码路径，避免 uri_from_fname 再次编码导致双重编码
+    local decoded_path = vim.uri_decode(path)
+    return vim.uri_from_fname(decoded_path)
   end
 
   -- 非 oil-ssh 场景走原逻辑

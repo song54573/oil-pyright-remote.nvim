@@ -12,7 +12,7 @@ local defaults = {
   auto_install = false,   -- 自动安装 LSP
   start_notify = false,   -- 启动时通知
   auto_prompt = true,     -- 自动提示输入环境路径
-  lsp_opts = {},          -- LSP 后端额外配置（ty: initializationOptions, pyright: settings.python.analysis）
+  lsp_opts = {},          -- LSP 后端 settings 覆盖（pyright: python.analysis, ty: ty.*）
 }
 
 -- 当前配置缓存
@@ -33,6 +33,7 @@ local vim_g_mappings = {
   pyright_remote_backend = "backend",
   pyright_remote_auto_install = "auto_install",
   pyright_remote_start_notify = "start_notify",
+  pyright_remote_auto_prompt = "auto_prompt",
 }
 
 -----------------------------------------------------------------------
