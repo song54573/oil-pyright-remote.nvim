@@ -15,10 +15,19 @@ Run `pyright-langserver` or `ty` over SSH and make every LSP interaction work on
   "song54573/oil-pyright-remote.nvim",
   dependencies = { "stevearc/oil.nvim" }, -- required for oil-ssh:// buffers
   lazy = false, -- start as soon as Python buffers open
+  config = function()
+    require("oil_pyright_remote").setup({})
+  end,
 }
 ```
 
-The entry file `plugin/oil_pyright_remote.lua` requires `oil_pyright_remote`, so commands/autocmds register automatically.
+The entry file `plugin/oil_pyright_remote.lua` only loads the module early.
+Commands, autocmds, and diagnostics handlers are registered by calling
+`require("oil_pyright_remote").setup({...})`.
+
+On Neovim 0.11+, the plugin registers a native `vim.lsp.config()` definition
+for `pyright_remote` and keeps the existing remote preflight checks in front of
+client startup.
 
 ### Remote prerequisites
 - SSH access to the target host (key or agent recommended).
