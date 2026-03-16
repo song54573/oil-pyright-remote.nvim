@@ -11,6 +11,10 @@ local state = require("oil_pyright_remote.state")
 -- 模块状态
 local initialized = false
 local user_command_deps = nil
+local ssh_host_cache = {
+  mtime = nil,
+  hosts = nil,
+}
 
 -----------------------------------------------------------------------
 -- M.create_user_commands(deps)
@@ -84,8 +88,16 @@ end
 -- 参数：标准 vim 命令补全参数
 -- 返回：主机名列表
 function M.list_ssh_hosts()
+  local config_path = vim.fn.expand("~/.ssh/config")
+  local stat = vim.loop.fs_stat(config_path)
+  local mtime = stat and stat.mtime and stat.mtime.sec or nil
+
+  if ssh_host_cache.hosts and ssh_host_cache.mtime == mtime then
+    return vim.deepcopy(ssh_host_cache.hosts)
+  end
+
   local hosts = {}
-  local ok, lines = pcall(vim.fn.readfile, vim.fn.expand("~/.ssh/config"))
+  local ok, lines = pcall(vim.fn.readfile, config_path)
   if not ok then
     return hosts
   end
@@ -97,7 +109,9 @@ function M.list_ssh_hosts()
     end
   end
 
-  return hosts
+  ssh_host_cache.mtime = mtime
+  ssh_host_cache.hosts = hosts
+  return vim.deepcopy(hosts)
 end
 
 -----------------------------------------------------------------------

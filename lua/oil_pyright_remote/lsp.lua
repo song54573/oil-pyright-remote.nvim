@@ -15,15 +15,25 @@ local diagnostics = require("oil_pyright_remote.diagnostics")
 -- 模块状态
 local initialized = false
 local capabilities = nil
+local native_mode = false
+local native_config_registered = false
+local native_config_enabled = false
+local native_ready_buffers = {}
+local remote_root_cache = {}
+local pending_root_probes = {}
+local runtime_cache = {}
+local root_correction_once = {}
+local last_registered_runtime = nil
 
 -- 支持的文件类型白名单（严格控制，避免错误附着）
 local SUPPORTED_FILETYPES = { "python" }
+local NATIVE_CONFIG_NAME = "pyright_remote"
 
 -----------------------------------------------------------------------
 -- 后端策略：不同 LSP 后端的配置生成策略
 -- 说明：
 --   - pyright: 使用 settings.python.analysis 配置格式
---   - ty: 使用 LSP initializationOptions 配置格式
+--   - ty: 使用 settings.ty.* 配置格式，静态项走 init_options
 --   每个策略返回：{ cmd, settings?, init_options? }
 -----------------------------------------------------------------------
 local backend_strategies = {
@@ -113,86 +123,14 @@ local function is_remote_oil_ssh_buffer(bufnr)
   return get_oil_ssh_host_from_bufname(name) ~= nil
 end
 
--- 在远程主机上寻找项目根：逐级向上检测 root_markers
-local function find_remote_root(remote_path, markers)
-  -- 安全校验：缺主机或路径直接放弃
-  if not remote_path or remote_path == "" then
-    return nil
+local function sync_host_from_bufnr(bufnr)
+  local host = get_oil_ssh_host_from_bufname(vim.api.nvim_buf_get_name(bufnr))
+  if host and host ~= "" then
+    config.set({ host = host })
+    return host
   end
-  local host = config.get("host")
-  if not host or host == "" then
-    return nil
-  end
-
-  markers = markers or (M.get_default_config().root_markers or {})
-  if #markers == 0 then
-    return nil
-  end
-
-  -- Shell 安全转义，防止路径中包含空格或单引号
-  local function esc(str)
-    return (str or ""):gsub("'", "'\\''")
-  end
-
-  local quoted_markers = {}
-  for _, m in ipairs(markers) do
-    table.insert(quoted_markers, string.format([["%s"]], m))
-  end
-
-  -- 使用 ssh 在远程侧逐级检查标记文件，找到则回显根路径
-  local script = string.format([[
-p='%s'
-while true; do
-  for m in %s; do
-    if [ -e "$p/$m" ]; then echo "$p"; exit 0; fi
-  done
-  parent="$(dirname "$p")"
-  if [ "$parent" = "$p" ] || [ "$p" = "/" ]; then break; fi
-  p="$parent"
-done
-exit 1
-]], esc(vim.fn.fnamemodify(remote_path, ":p")), table.concat(quoted_markers, " "))
-
-  local stdout = {}
-  local job = vim.fn.jobstart(ssh_runner.remote_bash(script), {
-    stdout_buffered = true,
-    on_stdout = function(_, data)
-      if not data then
-        return
-      end
-      for _, line in ipairs(data) do
-        if line ~= "" then
-          table.insert(stdout, line)
-        end
-      end
-    end,
-  })
-
-  if job <= 0 then
-    return nil
-  end
-
-  -- 最长等待 8s，失败则返回 nil 交给后续回退
-  local waited = vim.fn.jobwait({ job }, 8000)[1]
-  -- 重要：如果 waited == -1 表示超时，job 仍在运行（通常是 ssh 卡住）。
-  -- 必须显式 jobstop，否则后台会残留 ssh 进程，次数一多会拖慢/卡住整个 Neovim。
-  if waited == -1 then
-    pcall(vim.fn.jobstop, job)
-  end
-  if waited ~= 0 or #stdout == 0 then
-    return nil
-  end
-  return stdout[1]
+  return config.get("host")
 end
-
------------------------------------------------------------------------
--- 远程 root_dir 结果缓存（find_remote_root 的调用层缓存）
--- 设计目标：
---   1) 只缓存“远程路径 → root_dir”的计算结果，避免重复 SSH 往返
---   2) 缓存键包含 host/base/markers，确保不同主机/不同起点/不同标记不互相污染
---   3) 不改变 find_remote_root 的行为，只在调用层做性能优化
------------------------------------------------------------------------
-local remote_root_cache = {}
 
 local function build_root_cache_key(host, base, markers)
   -- 任一关键维度缺失时不做缓存，避免生成不可控的 key
@@ -208,47 +146,132 @@ local function build_root_cache_key(host, base, markers)
   return table.concat({ host, base, table.concat(markers, "\0") }, "\n")
 end
 
-local function find_remote_root_cached(base, markers)
-  -- 这里依然通过 config.get("host") 取主机名，保持与 find_remote_root 行为一致
-  local host = config.get("host")
-  local key = build_root_cache_key(host, base, markers)
-  if not key then
-    return find_remote_root(base, markers)
+local function build_runtime_cache_key(host, env_path, backend_name, root_dir, lsp_opts)
+  if not host or host == "" or not env_path or env_path == "" or not backend_name or backend_name == "" then
+    return nil
   end
-
-  local cached = remote_root_cache[key]
-  if cached then
-    return cached
+  if not root_dir or root_dir == "" then
+    return nil
   end
-
-  local root = find_remote_root(base, markers)
-  -- 只缓存“找到的 root”，避免缓存未命中导致后续无法感知新创建的标记文件
-  if root and root ~= "" then
-    remote_root_cache[key] = root
-  end
-  return root
+  return table.concat({
+    backend_name,
+    host,
+    env_path,
+    root_dir,
+    vim.inspect(lsp_opts or {}),
+  }, "\n")
 end
 
------------------------------------------------------------------------
--- 远程 root_dir 解析（统一构建 root_dir 的逻辑，避免多处重复）
--- 说明：
---   - 优先使用用户显式配置的 root
---   - 若未配置，则在远程侧寻找 root_markers
---   - 失败时退回到当前文件所在目录
------------------------------------------------------------------------
-local function resolve_root_dir_for_buf(bufnr, cfg)
-  local bufname = vim.api.nvim_buf_get_name(bufnr)
-  local remote_path = path.from_oil_path(bufname) or vim.fn.fnamemodify(bufname, ":p")
-
-  local root_dir = config.get("root")
-  if not root_dir or root_dir == "" then
-    local markers = cfg.root_markers or M.get_default_config().root_markers or {}
-    local base = vim.fn.fnamemodify(remote_path, ":p:h")
-    -- 使用缓存包装的远程 root 探测，减少重复 SSH
-    root_dir = find_remote_root_cached(base, markers) or base
+local function build_remote_root_script(remote_path, markers)
+  local function esc(str)
+    return (str or ""):gsub("'", "'\\''")
   end
 
-  return root_dir
+  local quoted_markers = {}
+  for _, marker in ipairs(markers or {}) do
+    table.insert(quoted_markers, string.format([["%s"]], marker))
+  end
+
+  return string.format([[
+p='%s'
+while true; do
+  for m in %s; do
+    if [ -e "$p/$m" ]; then echo "$p"; exit 0; fi
+  done
+  parent="$(dirname "$p")"
+  if [ "$parent" = "$p" ] || [ "$p" = "/" ]; then break; fi
+  p="$parent"
+done
+exit 1
+]], esc(vim.fn.fnamemodify(remote_path, ":p")), table.concat(quoted_markers, " "))
+end
+
+local function get_root_resolution_for_buf(bufnr, cfg)
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  local remote_path = path.from_oil_path(bufname) or vim.fn.fnamemodify(bufname, ":p")
+  local base = vim.fn.fnamemodify(remote_path, ":p:h")
+  local host = config.get("host")
+
+  local root_dir = config.get("root")
+  if root_dir and root_dir ~= "" then
+    return {
+      root_dir = root_dir,
+      base_dir = base,
+      remote_path = remote_path,
+      pinned = true,
+      resolved = true,
+      probe_key = nil,
+      markers = {},
+    }
+  end
+
+  local markers = cfg.root_markers or M.get_default_config().root_markers or {}
+  local probe_key = build_root_cache_key(host, base, markers)
+  local cached = probe_key and remote_root_cache[probe_key] or nil
+
+  return {
+    root_dir = cached or base,
+    base_dir = base,
+    remote_path = remote_path,
+    pinned = false,
+    resolved = cached ~= nil,
+    probe_key = probe_key,
+    markers = markers,
+  }
+end
+
+local function request_remote_root_probe(root_info, cb)
+  if type(cb) ~= "function" then
+    return nil
+  end
+
+  if not root_info or root_info.pinned or root_info.resolved then
+    vim.schedule(function()
+      cb(root_info and root_info.root_dir or nil)
+    end)
+    return root_info and root_info.probe_key or nil
+  end
+
+  local probe_key = root_info.probe_key
+  if not probe_key then
+    vim.schedule(function()
+      cb(root_info.base_dir)
+    end)
+    return nil
+  end
+
+  local cached = remote_root_cache[probe_key]
+  if cached then
+    vim.schedule(function()
+      cb(cached)
+    end)
+    return probe_key
+  end
+
+  pending_root_probes[probe_key] = pending_root_probes[probe_key] or {}
+  table.insert(pending_root_probes[probe_key], cb)
+  if #pending_root_probes[probe_key] > 1 then
+    return probe_key
+  end
+
+  ssh_runner.execute_remote_script(
+    build_remote_root_script(root_info.remote_path, root_info.markers),
+    function(ok, output)
+      local root = ok and output and output[1] or nil
+      if root and root ~= "" then
+        remote_root_cache[probe_key] = root
+      end
+
+      local waiters = pending_root_probes[probe_key] or {}
+      pending_root_probes[probe_key] = nil
+      for _, waiter in ipairs(waiters) do
+        pcall(waiter, root)
+      end
+    end,
+    { timeout = 8000, quiet = true, max_output_lines = 16 }
+  )
+
+  return probe_key
 end
 
 -----------------------------------------------------------------------
@@ -299,6 +322,373 @@ local function get_lsp_clients(opts)
   return clients
 end
 
+local function is_native_lsp_available()
+  return type(vim.lsp.config) == "table" and type(vim.lsp.enable) == "function"
+end
+
+local function build_ready_key(host, env_path, backend_name)
+  if not host or host == "" or not env_path or env_path == "" or not backend_name or backend_name == "" then
+    return nil
+  end
+  return table.concat({ backend_name, host, env_path }, "\n")
+end
+
+local function current_ready_key_for_buf(bufnr)
+  local host = get_oil_ssh_host_from_bufname(vim.api.nvim_buf_get_name(bufnr)) or config.get("host")
+  return build_ready_key(host, config.get("env"), config.get("backend"))
+end
+
+local function mark_buf_ready(bufnr)
+  local key = current_ready_key_for_buf(bufnr)
+  if key then
+    native_ready_buffers[bufnr] = key
+  end
+  return key
+end
+
+local function clear_buf_ready(bufnr)
+  native_ready_buffers[bufnr] = nil
+end
+
+local function is_buf_ready_for_native(bufnr)
+  local expected = native_ready_buffers[bufnr]
+  local current = current_ready_key_for_buf(bufnr)
+  if expected and current and expected == current then
+    return true
+  end
+  native_ready_buffers[bufnr] = nil
+  return false
+end
+
+-----------------------------------------------------------------------
+-- stop_lsp_client(target, force)
+-- 功能：兼容新旧 Neovim 的 LSP 停止 API
+-----------------------------------------------------------------------
+local function stop_lsp_client(target, force)
+  local client = target
+  local client_id = nil
+
+  if type(target) == "number" then
+    client_id = target
+    client = vim.lsp.get_client_by_id and vim.lsp.get_client_by_id(target) or nil
+  elseif type(target) == "table" then
+    client_id = target.id
+  end
+
+  if client and type(client.stop) == "function" then
+    local ok = pcall(client.stop, client, force == true)
+    if ok then
+      return true
+    end
+  end
+
+  if client_id and type(vim.lsp.stop_client) == "function" then
+    local ok = pcall(vim.lsp.stop_client, client_id, force == true)
+    if ok then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function should_reuse_client(client, client_config)
+  if not client or not client_config then
+    return false
+  end
+
+  if client.name ~= client_config.name then
+    return false
+  end
+
+  if type(client.is_stopped) == "function" and client:is_stopped() then
+    return false
+  end
+
+  local existing = client.config or {}
+  return existing.root_dir == client_config.root_dir
+    and existing._pyright_remote_host == client_config._pyright_remote_host
+end
+
+local function build_runtime_snapshot(host, env_path, backend_name, root_dir)
+  local strategy = backend_strategies[backend_name] or backend_strategies.pyright
+  local backend_config = strategy(env_path)
+  return {
+    host = host,
+    env = env_path,
+    backend = backend_name,
+    root_dir = root_dir,
+    workspace_folders = {
+      {
+        uri = vim.uri_from_fname(root_dir),
+        name = root_dir,
+      },
+    },
+    backend_config = backend_config,
+  }
+end
+
+local function build_runtime_for_buf(bufnr, cfg)
+  if not is_supported_buffer(bufnr) then
+    error("build_runtime_for_buf: unsupported filetype for buffer " .. bufnr)
+  end
+
+  cfg = cfg or M.get_default_config()
+
+  local host = sync_host_from_bufnr(bufnr)
+  if not host or host == "" then
+    error("build_runtime_for_buf: host is empty")
+  end
+
+  local env_path = config.get("env")
+  if not env_path or env_path == "" then
+    error("build_runtime_for_buf: env is empty")
+  end
+
+  local backend_name = config.get("backend")
+  local root_info = get_root_resolution_for_buf(bufnr, cfg)
+  local cache_key = build_runtime_cache_key(host, env_path, backend_name, root_info.root_dir, config.get("lsp_opts"))
+  local cached = cache_key and runtime_cache[cache_key] or nil
+  local runtime = cached or build_runtime_snapshot(host, env_path, backend_name, root_info.root_dir)
+
+  if cache_key and not cached then
+    runtime_cache[cache_key] = runtime
+  end
+
+  return {
+    host = runtime.host,
+    env = runtime.env,
+    backend = runtime.backend,
+    root_dir = runtime.root_dir,
+    workspace_folders = runtime.workspace_folders,
+    backend_config = runtime.backend_config,
+    root_info = root_info,
+    cache_key = cache_key,
+  }
+end
+
+local function build_client_config_from_runtime(bufnr, cfg, runtime)
+  local merged = vim.tbl_deep_extend("force", {}, cfg, {
+    name = NATIVE_CONFIG_NAME,
+    on_attach = M.on_attach,
+    capabilities = capabilities,
+    bufnr = bufnr,
+    root_dir = runtime.root_dir,
+    workspace_folders = runtime.workspace_folders,
+    handlers = M.handlers,
+    _pyright_remote_host = runtime.host,
+  }, runtime.backend_config)
+
+  if vim.g.pyright_remote_debug then
+    vim.notify(
+      string.format(
+        "[pyright_remote] LSP Config Debug:\n  Backend: %s\n  Root: %s\n  Settings: %s\n  Init Options: %s",
+        runtime.backend,
+        merged.root_dir,
+        vim.inspect(merged.settings or {}),
+        vim.inspect(merged.init_options or {})
+      ),
+      vim.log.levels.INFO
+    )
+  end
+
+  return merged
+end
+
+local function find_reusable_client(bufnr, client_config)
+  for _, client in ipairs(M.get_clients({ name = NATIVE_CONFIG_NAME })) do
+    if should_reuse_client(client, client_config) then
+      if not vim.lsp.buf_is_attached(bufnr, client.id) then
+        vim.lsp.buf_attach_client(bufnr, client.id)
+      end
+      state.reset_reconnect_attempted()
+      return client.id
+    end
+  end
+end
+
+local function start_client_for_buf(bufnr, client_config)
+  local reused = find_reusable_client(bufnr, client_config)
+  if reused then
+    return reused
+  end
+
+  if config.get("start_notify") then
+    vim.schedule(function()
+      pcall(
+        vim.notify,
+        string.format(
+          "[pyright_remote] starting. root=%s file=%s",
+          tostring(client_config.root_dir),
+          vim.api.nvim_buf_get_name(bufnr)
+        ),
+        vim.log.levels.INFO
+      )
+    end)
+  end
+
+  local client_id = vim.api.nvim_buf_call(bufnr, function()
+    return vim.lsp.start(client_config, {
+      bufnr = bufnr,
+      reuse_client = should_reuse_client,
+    })
+  end)
+
+  if client_id then
+    state.reset_reconnect_attempted()
+  end
+  return client_id
+end
+
+local function refresh_native_registered_config(runtime)
+  if not native_mode or not native_config_registered then
+    return
+  end
+
+  local registered = vim.lsp.config and vim.lsp.config[NATIVE_CONFIG_NAME]
+  if not registered then
+    return
+  end
+
+  local snapshot = {
+    cmd = runtime.backend_config.cmd,
+    settings = runtime.backend_config.settings or {},
+    init_options = runtime.backend_config.init_options or {},
+    workspace_folders = runtime.workspace_folders,
+    host = runtime.host,
+  }
+  if last_registered_runtime and vim.deep_equal(last_registered_runtime, snapshot) then
+    return
+  end
+
+  last_registered_runtime = vim.deepcopy(snapshot)
+  registered.cmd = vim.deepcopy(runtime.backend_config.cmd)
+  registered.settings = vim.deepcopy(runtime.backend_config.settings or {})
+  registered.init_options = vim.deepcopy(runtime.backend_config.init_options or {})
+  registered.workspace_folders = vim.deepcopy(runtime.workspace_folders)
+  registered._pyright_remote_host = runtime.host
+end
+
+local function build_native_client_config(bufnr, runtime)
+  local base = {}
+  if vim.lsp.config and vim.lsp.config[NATIVE_CONFIG_NAME] then
+    base = vim.deepcopy(vim.lsp.config[NATIVE_CONFIG_NAME])
+  else
+    base = vim.deepcopy(M.get_default_config())
+  end
+  return build_client_config_from_runtime(bufnr, base, runtime)
+end
+
+local function apply_hover_window_style(winid)
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+
+  local ok, current = pcall(vim.api.nvim_get_option_value, "winhighlight", { win = winid })
+  if not ok then
+    return
+  end
+
+  local highlight = current or ""
+  if highlight:find("FloatBorder:", 1, true) then
+    return
+  end
+
+  if highlight ~= "" then
+    highlight = highlight .. ","
+  end
+  highlight = highlight .. "FloatBorder:DiagnosticInfo"
+  pcall(vim.api.nvim_set_option_value, "winhighlight", highlight, { win = winid })
+end
+
+local function hover_handler(err, result, ctx, config_override)
+  local handler = vim.lsp.handlers.hover
+  local columns = tonumber(vim.o.columns) or 120
+  local lines = tonumber(vim.o.lines) or 40
+  local merged = vim.tbl_deep_extend("force", {
+    border = "single",
+    max_width = math.max(60, math.floor(columns * 0.5)),
+    max_height = math.max(8, math.floor(lines * 0.3)),
+  }, config_override or {})
+
+  local _, winid = handler(err, result, ctx, merged)
+  apply_hover_window_style(winid)
+  return _, winid
+end
+
+function M.hover(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+  local clients = M.get_clients({ bufnr = bufnr, name = NATIVE_CONFIG_NAME })
+  if not clients or #clients == 0 then
+    return vim.lsp.buf.hover()
+  end
+
+  local client = clients[1]
+  local params = vim.lsp.util.make_position_params(0, client.offset_encoding or "utf-16")
+  vim.lsp.buf_request(bufnr, "textDocument/hover", params, hover_handler)
+end
+
+local function restart_for_root_correction(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local clients = M.get_clients({ name = NATIVE_CONFIG_NAME })
+  if clients and #clients > 0 then
+    state.increment_suppress_count()
+    for _, client in ipairs(clients) do
+      stop_lsp_client(client, false)
+    end
+  end
+
+  vim.schedule(function()
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+      M.kick_existing_python()
+    end
+  end)
+end
+
+local function ensure_root_resolution_for_runtime(bufnr, runtime)
+  local root_info = runtime and runtime.root_info
+  if not root_info or root_info.pinned or root_info.resolved then
+    return
+  end
+
+  request_remote_root_probe(root_info, function(root)
+    local resolved = root and root ~= "" and root or root_info.base_dir
+    if resolved == runtime.root_dir then
+      return
+    end
+
+    if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) or not is_supported_buffer(bufnr) then
+      return
+    end
+
+    local correction_key = table.concat({
+      tostring(runtime.backend),
+      tostring(runtime.host),
+      tostring(runtime.env),
+      tostring(runtime.root_dir),
+      tostring(resolved),
+    }, "\n")
+    if root_correction_once[correction_key] then
+      return
+    end
+
+    local attached = M.get_clients({ bufnr = bufnr, name = NATIVE_CONFIG_NAME })
+    if not attached or #attached == 0 then
+      return
+    end
+    if attached[1].config and attached[1].config.root_dir == resolved then
+      return
+    end
+
+    root_correction_once[correction_key] = true
+    restart_for_root_correction(bufnr)
+  end)
+end
+
 -----------------------------------------------------------------------
 -- M.on_attach(client, bufnr)
 -- 功能：LSP 客户端附着回调
@@ -318,7 +708,9 @@ function M.on_attach(client, bufnr)
 
   -- 基础 LSP 键映射
   bufmap("n", "gd", vim.lsp.buf.definition, "Go to definition")
-  bufmap("n", "K", vim.lsp.buf.hover, "Hover")
+  bufmap("n", "K", function()
+    M.hover(bufnr)
+  end, "Hover")
   bufmap("n", "gr", vim.lsp.buf.references, "References")
   bufmap("n", "<leader>rn", vim.lsp.buf.rename, "Rename")
   bufmap("n", "<leader>ac", vim.lsp.buf.code_action, "Code action")
@@ -353,17 +745,6 @@ function M.on_attach(client, bufnr)
     bufmap("n", "gi", req("textDocument/implementation"), "Go to implementation (remote)")
     bufmap("n", "gD", req("textDocument/declaration"), "Go to declaration (remote)")
     bufmap("n", "gr", req("textDocument/references"), "References (remote)")
-
-    -- 通知用户客户端已附着
-    vim.notify(
-      string.format(
-        "[pyright_remote] attached. root: %s",
-        client.config.root_dir
-          or (client.config.workspace_folders or {})[1] and (client.config.workspace_folders or {})[1].name
-          or "?"
-      ),
-      vim.log.levels.INFO
-    )
   end
 end
 
@@ -382,52 +763,9 @@ end
 -- 参数：bufnr - 缓冲区编号
 -- 返回：配置表
 function M.build_config(bufnr)
-  if not is_supported_buffer(bufnr) then
-    error("build_config: unsupported filetype for buffer " .. bufnr)
-  end
-
-  local cfg = vim.deepcopy(M.get_default_config())
-
-  -- 远程根目录：优先用户配置，其次远程检测，最后退回文件所在目录
-  cfg.root_dir = resolve_root_dir_for_buf(bufnr, cfg)
-  cfg.workspace_folders = {
-    {
-      uri = vim.uri_from_fname(cfg.root_dir),
-      name = cfg.root_dir,
-    },
-  }
-
-  -- 获取后端特定配置（使用策略模式）
-  local backend_name = config.get("backend")
-  local env_path = config.get("env")
-  local strategy = backend_strategies[backend_name] or backend_strategies.pyright
-  local backend_config = strategy(env_path)
-
-  -- 合并运行时配置
-  cfg = vim.tbl_deep_extend("force", {}, cfg, {
-    name = "pyright_remote",
-    on_attach = M.on_attach,
-    capabilities = capabilities,
-    bufnr = bufnr,
-    handlers = M.handlers,                  -- 注入自定义处理器，确保诊断 URI 转换生效
-    _pyright_remote_host = config.get("host"), -- 将主机信息写入客户端配置，处理器可读取，避免 host 为空导致诊断丢失
-  }, backend_config)
-
-  -- 调试日志：输出完整配置（可通过 vim.g.pyright_remote_debug = true 启用）
-  if vim.g.pyright_remote_debug then
-    vim.notify(
-      string.format(
-        "[pyright_remote] LSP Config Debug:\n  Backend: %s\n  Root: %s\n  Settings: %s\n  Init Options: %s",
-        backend_name,
-        cfg.root_dir,
-        vim.inspect(cfg.settings or {}),
-        vim.inspect(cfg.init_options or {})
-      ),
-      vim.log.levels.INFO
-    )
-  end
-
-  return cfg
+  local base = vim.deepcopy(M.get_default_config())
+  local runtime = build_runtime_for_buf(bufnr, base)
+  return build_client_config_from_runtime(bufnr, base, runtime)
 end
 
 -----------------------------------------------------------------------
@@ -456,14 +794,14 @@ function M.stop_client_force(client_id, timeout_ms)
   diagnostics.cleanup_client(client_id)
 
   -- 尝试正常停止
-  vim.lsp.stop_client(client_id, false)
+  stop_lsp_client(client, false)
 
   -- 等待客户端退出，超时后强制终止
   vim.defer_fn(function()
     local still_alive = vim.lsp.get_client_by_id(client_id)
     if still_alive then
       -- 客户端仍然存活，强制停止
-      vim.lsp.stop_client(client_id, true)
+      stop_lsp_client(still_alive, true)
 
       -- 如果有 RPC 进程，尝试强杀
       if still_alive.rpc and still_alive.rpc.pid then
@@ -498,35 +836,7 @@ function M.enable_pyright_remote(bufnr)
     return
   end
 
-  -- 从缓冲区名称提取主机信息
-  local name = vim.api.nvim_buf_get_name(bufnr)
-  local h = get_oil_ssh_host_from_bufname(name)
-  if h and h ~= "" then
-    config.set({ host = h })
-  end
-
-  -- 计算当前缓冲区的 root_dir（用于复用现有客户端）
-  -- 这里使用统一的 root_dir 解析逻辑，确保与 build_config 保持一致
-  local root_dir = resolve_root_dir_for_buf(bufnr, M.get_default_config())
-  local host = config.get("host")
-
-  -- 显式复用已存在的 pyright_remote 客户端，避免同项目重复启动新进程
-  -- 匹配条件：
-  --   1) root_dir 相同（同一项目）
-  --   2) _pyright_remote_host 相同（同一远程主机）
-  local clients = M.get_clients({ name = "pyright_remote" })
-  for _, c in ipairs(clients) do
-    local c_cfg = c.config or {}
-    if c_cfg.root_dir == root_dir and c_cfg._pyright_remote_host == host then
-      -- 若尚未附着则附着到现有客户端
-      if not vim.lsp.buf_is_attached(bufnr, c.id) then
-        vim.lsp.buf_attach_client(bufnr, c.id)
-      end
-      -- 复用成功后，重置重连标记（避免误触发重连逻辑）
-      state.reset_reconnect_attempted()
-      return
-    end
-  end
+  sync_host_from_bufnr(bufnr)
 
   local function start_client()
     -- 防御性检查：缓冲区已被关闭的边缘情况（重连期间用户可能关闭了原文件）
@@ -534,31 +844,30 @@ function M.enable_pyright_remote(bufnr)
       return nil
     end
 
-    local cfg = M.build_config(bufnr)
+    mark_buf_ready(bufnr)
 
-    -- 启动通知
-    if config.get("start_notify") then
-      vim.schedule(function()
-        pcall(
-          vim.notify,
-          string.format(
-            "[pyright_remote] starting. root=%s file=%s",
-            tostring(cfg.root_dir),
-            vim.api.nvim_buf_get_name(bufnr)
-          ),
-          vim.log.levels.INFO
-        )
-      end)
+    local ok_runtime, runtime = pcall(build_runtime_for_buf, bufnr, M.get_default_config())
+    if not ok_runtime then
+      clear_buf_ready(bufnr)
+      vim.notify("[pyright_remote] runtime build failed: " .. tostring(runtime), vim.log.levels.ERROR)
+      return nil
     end
 
-    -- 关键修复：vim.lsp.start() 默认附着到"当前缓冲区"
-    -- 重连定时器触发时用户可能已切换到其他文件（非Python）
-    -- 使用 nvim_buf_call 临时切换上下文到目标 bufnr，避免误附着
-    local client_id = vim.api.nvim_buf_call(bufnr, function()
-      return vim.lsp.start(cfg)
-    end)
+    if native_mode then
+      refresh_native_registered_config(runtime)
+      local client_id = start_client_for_buf(bufnr, build_native_client_config(bufnr, runtime))
+      if client_id then
+        ensure_root_resolution_for_runtime(bufnr, runtime)
+      end
+      return client_id
+    end
+
+    local client_id = start_client_for_buf(
+      bufnr,
+      build_client_config_from_runtime(bufnr, vim.deepcopy(M.get_default_config()), runtime)
+    )
     if client_id then
-      state.reset_reconnect_attempted()
+      ensure_root_resolution_for_runtime(bufnr, runtime)
     end
     return client_id
   end
@@ -567,6 +876,8 @@ function M.enable_pyright_remote(bufnr)
   installer.ensure_env_and_pyright_async(function(ok)
     if ok then
       start_client()
+    else
+      clear_buf_ready(bufnr)
     end
   end)
 end
@@ -597,7 +908,7 @@ function M.restart_client(bufnr)
   if clients and #clients > 0 then
     state.increment_suppress_count()
     for _, c in ipairs(clients) do
-      vim.lsp.stop_client(c.id)
+      stop_lsp_client(c, false)
     end
   end
 
@@ -611,7 +922,7 @@ end
 -- 返回：配置表
 function M.get_default_config()
   return {
-    name = "pyright_remote",
+    name = NATIVE_CONFIG_NAME,
 
     -- 严格控制文件类型
     filetypes = SUPPORTED_FILETYPES,
@@ -642,6 +953,51 @@ function M.get_default_config()
     -- 注意：settings 和 init_options 由各个 backend 策略提供
     -- 不在这里设置默认值，避免不同 backend 之间的配置冲突
   }
+end
+
+local function build_native_registered_config()
+  local cfg = vim.deepcopy(M.get_default_config())
+  cfg.on_attach = M.on_attach
+  cfg.capabilities = capabilities
+  cfg.handlers = M.handlers
+  cfg.reuse_client = should_reuse_client
+  cfg.root_dir = function(bufnr, on_dir)
+    if not is_supported_buffer(bufnr) or not is_buf_ready_for_native(bufnr) then
+      return
+    end
+
+    local ok_runtime, runtime = pcall(build_runtime_for_buf, bufnr, M.get_default_config())
+    if not ok_runtime then
+      clear_buf_ready(bufnr)
+      return
+    end
+
+    refresh_native_registered_config(runtime)
+    on_dir(runtime.root_dir)
+  end
+
+  return cfg
+end
+
+local function register_native_config()
+  if not native_mode or native_config_registered then
+    return
+  end
+
+  vim.lsp.config(NATIVE_CONFIG_NAME, build_native_registered_config())
+  native_config_registered = true
+end
+
+local function enable_native_config()
+  if not native_mode or native_config_enabled then
+    return
+  end
+
+  local already_enabled = type(vim.lsp.is_enabled) == "function" and vim.lsp.is_enabled(NATIVE_CONFIG_NAME)
+  if not already_enabled then
+    vim.lsp.enable(NATIVE_CONFIG_NAME)
+  end
+  native_config_enabled = true
 end
 
 -----------------------------------------------------------------------
@@ -676,6 +1032,8 @@ function M.setup(capabilities_override)
     capabilities = vim.tbl_deep_extend("force", capabilities, capabilities_override)
   end
 
+  native_mode = is_native_lsp_available()
+
   -- 注册文件类型自动命令
   vim.api.nvim_create_autocmd("FileType", {
     pattern = SUPPORTED_FILETYPES,
@@ -688,14 +1046,10 @@ function M.setup(capabilities_override)
   -- 统一使用 diagnostics 模块的处理器，避免与 init.lua 重复逻辑
   M.handlers = diagnostics.get_handlers(M.jump_with_oil)
 
-  -- 注意：我们使用 vim.lsp.start() 而不是 vim.lsp.enable()
-  -- 因此不需要通过 vim.lsp.config() 注册配置
-  -- 如果未来需要支持 Neovim 0.11+ 的 vim.lsp.enable() 模式，
-  -- 需要在这里根据 backend 动态注册不同的配置
-  --
-  -- if vim.lsp and vim.lsp.config then
-  --   vim.lsp.config("pyright_remote", M.get_default_config())
-  -- end
+  if native_mode then
+    register_native_config()
+    enable_native_config()
+  end
 
   initialized = true
 
@@ -894,5 +1248,30 @@ end
 
 -- 处理器存储（由 setup 初始化）
 M.handlers = {}
+
+-- 仅供测试使用的兼容层导出，不属于稳定公开 API。
+M._compat = {
+  build_root_cache_key = build_root_cache_key,
+  build_runtime_cache_key = build_runtime_cache_key,
+  build_runtime_for_buf = build_runtime_for_buf,
+  build_client_config_from_runtime = build_client_config_from_runtime,
+  build_native_client_config = build_native_client_config,
+  get_root_resolution_for_buf = get_root_resolution_for_buf,
+  request_remote_root_probe = request_remote_root_probe,
+  ensure_root_resolution_for_runtime = ensure_root_resolution_for_runtime,
+  hover_handler = hover_handler,
+  apply_hover_window_style = apply_hover_window_style,
+  is_native_mode = function()
+    return native_mode
+  end,
+  is_buf_ready_for_native = is_buf_ready_for_native,
+  mark_buf_ready = mark_buf_ready,
+  clear_buf_ready = clear_buf_ready,
+  refresh_native_registered_config = refresh_native_registered_config,
+  register_native_config = register_native_config,
+  enable_native_config = enable_native_config,
+  stop_lsp_client = stop_lsp_client,
+  should_reuse_client = should_reuse_client,
+}
 
 return M
