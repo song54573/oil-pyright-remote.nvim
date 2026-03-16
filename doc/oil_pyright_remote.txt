@@ -41,12 +41,12 @@ INSTALLATION (LAZY.NVIM)*oil_pyright_remote-oil-pyright-remote.nvim-installation
 <
 
 The entry file `plugin/oil_pyright_remote.lua` only loads the module early.
-Commands/autocmds are registered after calling
+Commands, autocmds, and diagnostics handlers are registered by calling
 `require("oil_pyright_remote").setup({...})`.
 
-On Neovim 0.11+, the plugin registers a native `vim.lsp.config()`
-configuration for `pyright_remote` while preserving the existing remote
-preflight checks before client startup.
+On Neovim 0.11+, the plugin registers a native `vim.lsp.config()` definition
+for `pyright_remote` and keeps the existing remote preflight checks in front of
+client startup.
 
 
 REMOTE PREREQUISITES ~
