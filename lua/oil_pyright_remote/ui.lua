@@ -132,7 +132,8 @@ function M.env_complete(arg_lead, list_envs_fn)
     return s:gsub("(%W)", "%%%1")
   end
 
-  local envs = list_envs_fn(config.get("host")) or {}
+  local host = config.get("host")
+  local envs = state.get_validated_envs(host, { timeout = 15000 }) or list_envs_fn(host) or {}
   for _, env in ipairs(envs) do
     if env:find("^" .. esc(prefix)) then
       table.insert(res, env)

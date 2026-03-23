@@ -24,10 +24,63 @@ local pending_root_probes = {}
 local runtime_cache = {}
 local root_correction_once = {}
 local last_registered_runtime = nil
+local cache_tick = 0
 
 -- 支持的文件类型白名单（严格控制，避免错误附着）
 local SUPPORTED_FILETYPES = { "python" }
 local NATIVE_CONFIG_NAME = "pyright_remote"
+local ROOT_CACHE_LIMIT = 128
+local RUNTIME_CACHE_LIMIT = 64
+local ROOT_CORRECTION_LIMIT = 128
+
+local function next_cache_tick()
+  cache_tick = cache_tick + 1
+  return cache_tick
+end
+
+local function cache_get(cache, key)
+  local entry = cache[key]
+  if not entry then
+    return nil
+  end
+  entry.at = next_cache_tick()
+  return entry.value
+end
+
+local function cache_put(cache, key, value, limit)
+  if not key then
+    return
+  end
+
+  cache[key] = {
+    value = value,
+    at = next_cache_tick(),
+  }
+
+  local count = 0
+  local oldest_key = nil
+  local oldest_at = nil
+  for cur_key, entry in pairs(cache) do
+    count = count + 1
+    if oldest_at == nil or entry.at < oldest_at then
+      oldest_at = entry.at
+      oldest_key = cur_key
+    end
+  end
+
+  while limit and count > limit and oldest_key do
+    cache[oldest_key] = nil
+    count = count - 1
+    oldest_key = nil
+    oldest_at = nil
+    for cur_key, entry in pairs(cache) do
+      if oldest_at == nil or entry.at < oldest_at then
+        oldest_at = entry.at
+        oldest_key = cur_key
+      end
+    end
+  end
+end
 
 -----------------------------------------------------------------------
 -- 后端策略：不同 LSP 后端的配置生成策略
@@ -207,7 +260,7 @@ local function get_root_resolution_for_buf(bufnr, cfg)
 
   local markers = cfg.root_markers or M.get_default_config().root_markers or {}
   local probe_key = build_root_cache_key(host, base, markers)
-  local cached = probe_key and remote_root_cache[probe_key] or nil
+  local cached = probe_key and cache_get(remote_root_cache, probe_key) or nil
 
   return {
     root_dir = cached or base,
@@ -240,7 +293,7 @@ local function request_remote_root_probe(root_info, cb)
     return nil
   end
 
-  local cached = remote_root_cache[probe_key]
+  local cached = cache_get(remote_root_cache, probe_key)
   if cached then
     vim.schedule(function()
       cb(cached)
@@ -254,12 +307,12 @@ local function request_remote_root_probe(root_info, cb)
     return probe_key
   end
 
-  ssh_runner.execute_remote_script(
+  local started = ssh_runner.execute_remote_script(
     build_remote_root_script(root_info.remote_path, root_info.markers),
     function(ok, output)
       local root = ok and output and output[1] or nil
       if root and root ~= "" then
-        remote_root_cache[probe_key] = root
+        cache_put(remote_root_cache, probe_key, root, ROOT_CACHE_LIMIT)
       end
 
       local waiters = pending_root_probes[probe_key] or {}
@@ -270,6 +323,16 @@ local function request_remote_root_probe(root_info, cb)
     end,
     { timeout = 8000, quiet = true, max_output_lines = 16 }
   )
+
+  if not started then
+    local waiters = pending_root_probes[probe_key] or {}
+    pending_root_probes[probe_key] = nil
+    vim.schedule(function()
+      for _, waiter in ipairs(waiters) do
+        pcall(waiter, nil)
+      end
+    end)
+  end
 
   return probe_key
 end
@@ -448,11 +511,11 @@ local function build_runtime_for_buf(bufnr, cfg)
   local backend_name = config.get("backend")
   local root_info = get_root_resolution_for_buf(bufnr, cfg)
   local cache_key = build_runtime_cache_key(host, env_path, backend_name, root_info.root_dir, config.get("lsp_opts"))
-  local cached = cache_key and runtime_cache[cache_key] or nil
+  local cached = cache_key and cache_get(runtime_cache, cache_key) or nil
   local runtime = cached or build_runtime_snapshot(host, env_path, backend_name, root_info.root_dir)
 
   if cache_key and not cached then
-    runtime_cache[cache_key] = runtime
+    cache_put(runtime_cache, cache_key, runtime, RUNTIME_CACHE_LIMIT)
   end
 
   return {
@@ -672,7 +735,7 @@ local function ensure_root_resolution_for_runtime(bufnr, runtime)
       tostring(runtime.root_dir),
       tostring(resolved),
     }, "\n")
-    if root_correction_once[correction_key] then
+    if cache_get(root_correction_once, correction_key) then
       return
     end
 
@@ -684,9 +747,38 @@ local function ensure_root_resolution_for_runtime(bufnr, runtime)
       return
     end
 
-    root_correction_once[correction_key] = true
+    cache_put(root_correction_once, correction_key, true, ROOT_CORRECTION_LIMIT)
     restart_for_root_correction(bufnr)
   end)
+end
+
+local function clear_ready_buffers_for_client(client_id)
+  local client = client_id and vim.lsp.get_client_by_id and vim.lsp.get_client_by_id(client_id) or nil
+  if client and client.attached_buffers then
+    for bufnr, _ in pairs(client.attached_buffers) do
+      clear_buf_ready(bufnr)
+    end
+  end
+
+  for bufnr, _ in pairs(native_ready_buffers) do
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      native_ready_buffers[bufnr] = nil
+    end
+  end
+end
+
+local function handle_client_exit(code, signal, client_id)
+  diagnostics.cleanup_client(client_id)
+  clear_ready_buffers_for_client(client_id)
+
+  vim.schedule(function()
+    local clients = M.get_clients({ name = NATIVE_CONFIG_NAME })
+    if not clients or #clients == 0 then
+      last_registered_runtime = nil
+    end
+  end)
+
+  state.pyright_on_exit(code, signal, client_id)
 end
 
 -----------------------------------------------------------------------
@@ -944,7 +1036,7 @@ function M.get_default_config()
 
     -- 退出回调
     on_exit = function(code, signal, client_id)
-      state.pyright_on_exit(code, signal, client_id)
+      handle_client_exit(code, signal, client_id)
     end,
 
     -- 处理器初始化（默认为空，由 setup 填充）
@@ -1000,6 +1092,16 @@ local function enable_native_config()
   native_config_enabled = true
 end
 
+function M.cleanup()
+  remote_root_cache = {}
+  pending_root_probes = {}
+  runtime_cache = {}
+  root_correction_once = {}
+  native_ready_buffers = {}
+  last_registered_runtime = nil
+  cache_tick = 0
+end
+
 -----------------------------------------------------------------------
 -- M.setup(capabilities_override)
 -- 功能：初始化 LSP 模块
@@ -1039,6 +1141,11 @@ function M.setup(capabilities_override)
     pattern = SUPPORTED_FILETYPES,
     callback = function(args)
       M.enable_pyright_remote(args.buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
+    callback = function(args)
+      clear_buf_ready(args.buf)
     end,
   })
 
@@ -1261,6 +1368,7 @@ M._compat = {
   ensure_root_resolution_for_runtime = ensure_root_resolution_for_runtime,
   hover_handler = hover_handler,
   apply_hover_window_style = apply_hover_window_style,
+  handle_client_exit = handle_client_exit,
   is_native_mode = function()
     return native_mode
   end,
@@ -1272,6 +1380,7 @@ M._compat = {
   enable_native_config = enable_native_config,
   stop_lsp_client = stop_lsp_client,
   should_reuse_client = should_reuse_client,
+  cleanup = M.cleanup,
 }
 
 return M

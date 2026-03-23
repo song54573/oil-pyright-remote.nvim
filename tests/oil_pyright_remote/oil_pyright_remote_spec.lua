@@ -95,6 +95,48 @@ describe("oil_pyright_remote", function()
     assert.is_false(config.get("auto_prompt"))
   end)
 
+  it("prunes invalid env history entries and validated store entries", function()
+    local state = require("oil_pyright_remote.state")
+    local ssh_runner = require("oil_pyright_remote.ssh_runner")
+    local original_execute_remote_script_on_host = ssh_runner.execute_remote_script_on_host
+    local store = state.load_env_store()
+    local vstore = state.load_valid_store()
+    local result = nil
+
+    store["demo-host"] = {
+      envs = { "/env/good", "/env/bad", "/env/good" },
+      last_env = "/env/bad",
+    }
+    vstore["pyright:demo-host"] = {
+      ["/env/good"] = true,
+      ["/env/bad"] = true,
+    }
+    vstore["ty:demo-host"] = {
+      ["/env/bad"] = true,
+    }
+
+    ssh_runner.execute_remote_script_on_host = function(host, script, cb)
+      assert.are.equal("demo-host", host)
+      assert.truthy(script:match("/env/good"))
+      assert.truthy(script:match("/env/bad"))
+      cb(true, { "OK\t/env/good" })
+      return 1
+    end
+
+    state.get_validated_envs_async("demo-host", function(envs)
+      result = envs
+    end, { force = true, timeout = 10 })
+
+    ssh_runner.execute_remote_script_on_host = original_execute_remote_script_on_host
+
+    assert.are.same({ "/env/good" }, result)
+    assert.are.same({ "/env/good" }, store["demo-host"].envs)
+    assert.are.equal("/env/good", store["demo-host"].last_env)
+    assert.is_true(vstore["pyright:demo-host"]["/env/good"])
+    assert.is_nil(vstore["pyright:demo-host"]["/env/bad"])
+    assert.is_nil(vstore["ty:demo-host"])
+  end)
+
   it("decodes oil-ssh paths before converting to file uris", function()
     local path = require("oil_pyright_remote.path")
     local bufnr = vim.api.nvim_create_buf(false, true)
@@ -311,6 +353,37 @@ describe("oil_pyright_remote", function()
     assert.is_true(runtime1.workspace_folders == runtime2.workspace_folders)
   end)
 
+  it("clears runtime cache on lsp cleanup", function()
+    local config = require("oil_pyright_remote.config")
+    config.set({
+      host = "demo-host",
+      env = "/tmp/demo-env",
+      root = "/remote/project",
+    })
+
+    local lsp = require("oil_pyright_remote.lsp")
+    local ssh_runner = require("oil_pyright_remote.ssh_runner")
+    local original_build_pyright_cmd = ssh_runner.build_pyright_cmd
+    local build_count = 0
+
+    ssh_runner.build_pyright_cmd = function()
+      build_count = build_count + 1
+      return { "ssh", "demo-host", "pyright-langserver", "--stdio" }
+    end
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(buf, "oil-ssh://demo-host//remote/project/cleanup.py")
+    vim.bo[buf].filetype = "python"
+
+    lsp._compat.build_runtime_for_buf(buf, lsp.get_default_config())
+    lsp._compat.cleanup()
+    lsp._compat.build_runtime_for_buf(buf, lsp.get_default_config())
+
+    ssh_runner.build_pyright_cmd = original_build_pyright_cmd
+
+    assert.are.equal(2, build_count)
+  end)
+
   it("deduplicates async remote root probes and fan-outs the result", function()
     local config = require("oil_pyright_remote.config")
     config.set({
@@ -477,5 +550,70 @@ describe("oil_pyright_remote", function()
     assert.are.equal("textDocument/hover", received.method)
     assert.are.equal("single", received.config.border)
     assert.are.equal("FloatBorder:DiagnosticInfo", received.winhighlight)
+  end)
+
+  it("cleans diagnostics namespaces on client exit path", function()
+    local lsp = require("oil_pyright_remote.lsp")
+    local diagnostics = require("oil_pyright_remote.diagnostics")
+    local state = require("oil_pyright_remote.state")
+    local original_cleanup_client = diagnostics.cleanup_client
+    local original_pyright_on_exit = state.pyright_on_exit
+    local cleanup_id = nil
+    local exit_args = nil
+
+    diagnostics.cleanup_client = function(client_id)
+      cleanup_id = client_id
+    end
+    state.pyright_on_exit = function(code, signal, client_id)
+      exit_args = { code, signal, client_id }
+    end
+
+    lsp._compat.handle_client_exit(11, 9, 42)
+
+    diagnostics.cleanup_client = original_cleanup_client
+    state.pyright_on_exit = original_pyright_on_exit
+
+    assert.are.equal(42, cleanup_id)
+    assert.are.same({ 11, 9, 42 }, exit_args)
+  end)
+
+  it("installs ty via uv and bootstraps uv when missing", function()
+    local config = require("oil_pyright_remote.config")
+    config.set({
+      backend = "ty",
+      env = "/tmp/demo-env",
+      auto_install = true,
+    })
+
+    local installer = require("oil_pyright_remote.installer")
+    local ssh_runner = require("oil_pyright_remote.ssh_runner")
+    local original_execute_remote_script = ssh_runner.execute_remote_script
+    local scripts = {}
+    local calls = 0
+    local result = nil
+
+    ssh_runner.execute_remote_script = function(script, cb)
+      calls = calls + 1
+      table.insert(scripts, script)
+      if calls == 1 then
+        cb(false, { "missing ty" }, 1)
+      elseif calls == 2 then
+        cb(true, { "installed uv and ty" }, 0)
+      else
+        cb(true, { "ty ok" }, 0)
+      end
+      return 1
+    end
+
+    installer.ensure_ty_installed_async("/tmp/demo-env/bin/python", function(ok, declined)
+      result = { ok, declined }
+    end, { quiet = true })
+
+    ssh_runner.execute_remote_script = original_execute_remote_script
+
+    assert.are.same({ true, false }, result)
+    assert.truthy(scripts[2]:match("pip install %-U uv"))
+    assert.truthy(scripts[2]:match("uv pip install %-%-python"))
+    assert.truthy(scripts[2]:match("%-%-upgrade ty"))
   end)
 end)

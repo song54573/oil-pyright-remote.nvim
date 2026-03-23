@@ -43,6 +43,22 @@ local function build_ssh_cmd(host, script)
 end
 
 -----------------------------------------------------------------------
+-- M.remote_bash_for_host(host, script)
+-- 功能：为指定主机构造远程 bash 执行命令
+-----------------------------------------------------------------------
+function M.remote_bash_for_host(host, script)
+  if not host or host == "" then
+    error("remote_bash_for_host: 主机名未设置")
+  end
+
+  if type(script) ~= "string" or script == "" then
+    error("remote_bash_for_host: script 必须是非空字符串")
+  end
+
+  return build_ssh_cmd(host, script)
+end
+
+-----------------------------------------------------------------------
 -- M.remote_bash(script)
 -- 功能：构造远程 bash 执行命令
 -- 参数：script - 要在远程执行的 shell 脚本
@@ -57,7 +73,7 @@ function M.remote_bash(script)
     error("remote_bash: script 必须是非空字符串")
   end
 
-  return build_ssh_cmd(host, script)
+  return M.remote_bash_for_host(host, script)
 end
 
 -----------------------------------------------------------------------
@@ -370,6 +386,15 @@ end
 -- 返回：job ID 或 nil
 function M.execute_remote_script(script, cb, opts)
   local cmd = M.remote_bash(script)
+  return M.run_async(cmd, cb or function() end, opts)
+end
+
+-----------------------------------------------------------------------
+-- M.execute_remote_script_on_host(host, script, cb, opts)
+-- 功能：在指定远程主机上执行脚本
+-----------------------------------------------------------------------
+function M.execute_remote_script_on_host(host, script, cb, opts)
+  local cmd = M.remote_bash_for_host(host, script)
   return M.run_async(cmd, cb or function() end, opts)
 end
 

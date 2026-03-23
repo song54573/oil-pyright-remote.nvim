@@ -123,6 +123,8 @@ end
 -- M.cleanup()
 -- 功能：清理资源
 function M.cleanup()
+  diagnostics.cleanup()
+  lsp.cleanup()
   state.cleanup()
   ssh_runner.cleanup()
 end

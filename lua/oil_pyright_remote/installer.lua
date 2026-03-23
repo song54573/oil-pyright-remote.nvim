@@ -76,25 +76,26 @@ function M.prompt_env_path_async(cb, opts)
   local current_env = config.get("env")
   if not current_env or current_env == "" then
     local host = config.get("host")
-    local envs = state.list_envs(host)
-    if #envs == 1 then
-      -- 只有一个环境时自动使用，直接返回不阻塞UI
-      config.set({ env = envs[1] })
-      cb(envs[1] .. "/bin/python")
-    elseif #envs > 1 then
-      -- 多个环境时让用户选择，但由于prompted_env已置位，本session只会出现一次
-      M.select_env_async(host, function(choice)
-        if choice and choice ~= "" then
-          config.set({ env = choice })
-          cb(choice .. "/bin/python")
-        else
-          cb(nil)
-        end
-      end)
-    else
-      -- 没有历史记录，直接询问
-      ask_python()
-    end
+    state.get_validated_envs_async(host, function(envs)
+      if #envs == 1 then
+        -- 只有一个环境时自动使用，直接返回不阻塞UI
+        config.set({ env = envs[1] })
+        cb(envs[1] .. "/bin/python")
+      elseif #envs > 1 then
+        -- 多个环境时让用户选择，但由于prompted_env已置位，本session只会出现一次
+        M.select_env_async(host, function(choice)
+          if choice and choice ~= "" then
+            config.set({ env = choice })
+            cb(choice .. "/bin/python")
+          else
+            cb(nil)
+          end
+        end, envs)
+      else
+        -- 没有历史记录，直接询问
+        ask_python()
+      end
+    end, { force = true, timeout = opts.timeout or 15000 })
   else
     -- 已有配置的环境，直接使用不阻塞UI
     cb(current_env .. "/bin/python")
@@ -107,163 +108,174 @@ end
 -- 参数：
 --   host - 主机名
 --   cb   - 回调函数 cb(selected_env)
-function M.select_env_async(host, cb)
+function M.select_env_async(host, cb, envs_override)
   -- 先清理旧的浮窗，避免残留
   M.cleanup_floating_window()
 
-  local envs = state.list_envs(host)
-  if not envs or #envs == 0 then
-    cb(nil)
-    return
-  end
+  local function render_select(envs)
+    if not envs or #envs == 0 then
+      cb(nil)
+      return
+    end
 
-  -- 首选原生 vim.ui.select，减少自绘浮窗残留几率
-  if vim.ui.select then
-    floating_state.closed = false
-    floating_state.timer = vim.loop.new_timer()
+    -- 首选原生 vim.ui.select，减少自绘浮窗残留几率
+    if vim.ui.select then
+      floating_state.closed = false
+      floating_state.timer = vim.loop.new_timer()
 
-    -- 兜底 15s 超时，超时自动收尾
-    floating_state.timer:start(15000, 0, function()
-      vim.schedule(function()
-        if not floating_state.closed then
-          floating_state.closed = true
-          cb(nil)
+      -- 兜底 15s 超时，超时自动收尾
+      floating_state.timer:start(15000, 0, function()
+        vim.schedule(function()
+          if not floating_state.closed then
+            floating_state.closed = true
+            cb(nil)
+          end
+          if floating_state.timer then
+            floating_state.timer:close()
+            floating_state.timer = nil
+          end
+        end)
+      end)
+
+      vim.ui.select(envs, {
+        prompt = "Select Python virtual environment:",
+        format_item = function(item)
+          return item
+        end,
+      }, function(choice)
+        if floating_state.closed then
+          return
         end
+        floating_state.closed = true
         if floating_state.timer then
           floating_state.timer:close()
           floating_state.timer = nil
         end
+        cb(choice)
       end)
-    end)
+      return
+    end
 
-    vim.ui.select(envs, {
-      prompt = "Select Python virtual environment:",
-      format_item = function(item)
-        return item
-      end,
-    }, function(choice)
+    -- 自绘浮窗回退方案
+    local maxlen = 0
+    for _, v in ipairs(envs) do
+      maxlen = math.max(maxlen, #v)
+    end
+    local width = math.min(math.max(maxlen + 4, 24), math.max(24, vim.o.columns - 4))
+    local height = math.min(#envs, 10)
+    local row = math.floor((vim.o.lines - height) / 2)
+    local col = math.floor((vim.o.columns - width) / 2)
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, envs)
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+    vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+
+    local win = vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      row = row,
+      col = col,
+      width = width,
+      height = height,
+      style = "minimal",
+      border = "rounded",
+    })
+
+    floating_state.win = win
+    floating_state.buf = buf
+    floating_state.closed = false
+
+    local cursor = 1
+    vim.api.nvim_win_set_cursor(win, { cursor, 0 })
+
+    local function finish(choice)
       if floating_state.closed then
         return
       end
       floating_state.closed = true
+
       if floating_state.timer then
+        floating_state.timer:stop()
         floating_state.timer:close()
         floating_state.timer = nil
       end
+
+      if win and vim.api.nvim_win_is_valid(win) then
+        pcall(vim.api.nvim_win_close, win, true)
+      end
+      if buf and vim.api.nvim_buf_is_valid(buf) then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end
+
+      floating_state.win = nil
+      floating_state.buf = nil
+
       cb(choice)
+    end
+
+    local function move(delta)
+      cursor = math.max(1, math.min(cursor + delta, #envs))
+      if win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_set_cursor(win, { cursor, 0 })
+      end
+    end
+
+    -- 键位映射
+    vim.keymap.set("n", "<CR>", function()
+      finish(envs[cursor])
+    end, { buffer = buf, nowait = true, silent = true })
+    vim.keymap.set("n", "<Esc>", function()
+      finish(nil)
+    end, { buffer = buf, nowait = true, silent = true })
+    vim.keymap.set("n", "q", function()
+      finish(nil)
+    end, { buffer = buf, nowait = true, silent = true })
+    vim.keymap.set("n", "j", function()
+      move(1)
+    end, { buffer = buf, nowait = true, silent = true })
+    vim.keymap.set("n", "k", function()
+      move(-1)
+    end, { buffer = buf, nowait = true, silent = true })
+    vim.keymap.set("n", "<Down>", function()
+      move(1)
+    end, { buffer = buf, nowait = true, silent = true })
+    vim.keymap.set("n", "<Up>", function()
+      move(-1)
+    end, { buffer = buf, nowait = true, silent = true })
+
+    -- 更稳健的清理：离开、隐藏、窗口被外部关闭都立即收尾
+    vim.api.nvim_create_autocmd({ "BufLeave", "BufHidden" }, {
+      buffer = buf,
+      once = true,
+      callback = function()
+        finish(nil)
+      end,
+    })
+    vim.api.nvim_create_autocmd("WinClosed", {
+      pattern = tostring(win),
+      once = true,
+      callback = function()
+        finish(nil)
+      end,
+    })
+
+    -- 兜底超时（15s）防遗留
+    floating_state.timer = vim.loop.new_timer()
+    floating_state.timer:start(15000, 0, function()
+      vim.schedule(function()
+        finish(nil)
+      end)
     end)
+  end
+
+  if envs_override then
+    render_select(envs_override)
     return
   end
 
-  -- 自绘浮窗回退方案
-  local maxlen = 0
-  for _, v in ipairs(envs) do
-    maxlen = math.max(maxlen, #v)
-  end
-  local width = math.min(math.max(maxlen + 4, 24), math.max(24, vim.o.columns - 4))
-  local height = math.min(#envs, 10)
-  local row = math.floor((vim.o.lines - height) / 2)
-  local col = math.floor((vim.o.columns - width) / 2)
-
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, envs)
-  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    row = row,
-    col = col,
-    width = width,
-    height = height,
-    style = "minimal",
-    border = "rounded",
-  })
-
-  floating_state.win = win
-  floating_state.buf = buf
-  floating_state.closed = false
-
-  local cursor = 1
-  vim.api.nvim_win_set_cursor(win, { cursor, 0 })
-
-  local function finish(choice)
-    if floating_state.closed then
-      return
-    end
-    floating_state.closed = true
-
-    if floating_state.timer then
-      floating_state.timer:close()
-      floating_state.timer = nil
-    end
-
-    if win and vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_close, win, true)
-    end
-    if buf and vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    end
-
-    floating_state.win = nil
-    floating_state.buf = nil
-
-    cb(choice)
-  end
-
-  local function move(delta)
-    cursor = math.max(1, math.min(cursor + delta, #envs))
-    if win and vim.api.nvim_win_is_valid(win) then
-      vim.api.nvim_win_set_cursor(win, { cursor, 0 })
-    end
-  end
-
-  -- 键位映射
-  vim.keymap.set("n", "<CR>", function()
-    finish(envs[cursor])
-  end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "<Esc>", function()
-    finish(nil)
-  end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "q", function()
-    finish(nil)
-  end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "j", function()
-    move(1)
-  end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "k", function()
-    move(-1)
-  end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "<Down>", function()
-    move(1)
-  end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "<Up>", function()
-    move(-1)
-  end, { buffer = buf, nowait = true, silent = true })
-
-  -- 更稳健的清理：离开、隐藏、窗口被外部关闭都立即收尾
-  vim.api.nvim_create_autocmd({ "BufLeave", "BufHidden" }, {
-    buffer = buf,
-    once = true,
-    callback = function()
-      finish(nil)
-    end,
-  })
-  vim.api.nvim_create_autocmd("WinClosed", {
-    pattern = tostring(win),
-    once = true,
-    callback = function()
-      finish(nil)
-    end,
-  })
-
-  -- 兜底超时（15s）防遗留
-  floating_state.timer = vim.loop.new_timer()
-  floating_state.timer:start(15000, 0, function()
-    vim.schedule(function()
-      finish(nil)
-    end)
-  end)
+  state.get_validated_envs_async(host, function(envs)
+    render_select(envs)
+  end, { force = true, timeout = 15000 })
 end
 
 -----------------------------------------------------------------------
@@ -272,6 +284,7 @@ end
 -----------------------------------------------------------------------
 function M.cleanup_floating_window()
   if floating_state.timer then
+    floating_state.timer:stop()
     floating_state.timer:close()
     floating_state.timer = nil
   end
@@ -296,6 +309,8 @@ local BACKENDS = {
   pyright = {
     package = "pyright",
     binary = "pyright-langserver",
+    install_label = "pip",
+    install_prompt = "Install via pip?",
     check_script = function(py_bin, env_bin)
       return string.format([[
 PYBIN="%s"
@@ -307,10 +322,20 @@ if [ -x "$ENV_BIN/pyright-langserver" ]; then "$ENV_BIN/pyright-langserver" --ve
 exit 1
 ]], py_bin, env_bin)
     end,
+    install_script = function(py_bin, env_bin)
+      return string.format([[
+PYBIN="%s"
+if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
+"$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
+"$PYBIN" -m pip install -U pyright
+]], py_bin, env_bin)
+    end,
   },
   ty = {
     package = "ty",
     binary = "ty",
+    install_label = "uv",
+    install_prompt = "Install or upgrade via uv?",
     check_script = function(py_bin, env_bin)
       return string.format([[
 PYBIN="%s"
@@ -319,6 +344,26 @@ ENV_BIN="%s"
 if [ -x "$ENV_BIN/ty" ]; then "$ENV_BIN/ty" server --help >/dev/null 2>&1 && exit 0; fi
 "$PYBIN" -m pip show ty >/dev/null 2>&1 && exit 0
 exit 1
+]], py_bin, env_bin)
+    end,
+    install_script = function(py_bin, env_bin)
+      return string.format([[
+PYBIN="%s"
+ENV_BIN="%s"
+UV_BIN="$ENV_BIN/uv"
+if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
+"$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
+if [ ! -x "$UV_BIN" ]; then
+  echo "[installer] uv missing in env, installing uv ..."
+  "$PYBIN" -m pip install -U uv || exit $?
+fi
+if [ -x "$UV_BIN" ]; then
+  "$UV_BIN" --version || exit $?
+  "$UV_BIN" pip install --python "$PYBIN" --upgrade ty || exit $?
+else
+  "$PYBIN" -m uv --version || exit $?
+  "$PYBIN" -m uv pip install --python "$PYBIN" --upgrade ty || exit $?
+fi
 ]], py_bin, env_bin)
     end,
   },
@@ -365,10 +410,16 @@ local function ensure_backend_installed_async(backend_name, py_bin, cb, opts)
     local proceed_install = auto_install
 
     if not proceed_install then
-      local ans = vim.fn.input(string.format("%s not detected in remote env. Install via pip? [y/N]: ", backend_cfg.package))
+      local ans = vim.fn.input(
+        string.format("%s not detected in remote env. %s [y/N]: ", backend_cfg.package, backend_cfg.install_prompt or "Install now?")
+      )
       proceed_install = ans:lower() == "y"
     else
-      notify(string.format("[installer] auto-installing %s ... (%s)", backend_name, env), vim.log.levels.INFO, quiet)
+      notify(
+        string.format("[installer] auto-installing %s via %s ... (%s)", backend_name, backend_cfg.install_label or "installer", env),
+        vim.log.levels.INFO,
+        quiet
+      )
     end
 
     if not proceed_install then
@@ -377,24 +428,28 @@ local function ensure_backend_installed_async(backend_name, py_bin, cb, opts)
       return
     end
 
-    local install_script = string.format([[
-PYBIN="%s"
-if ! "$PYBIN" -V >/dev/null 2>&1; then echo "python not runnable: $PYBIN" >&2; exit 2; fi
-"$PYBIN" -c "import sys; print('[installer] using python', sys.executable)"
-"$PYBIN" -m pip install %s
-]], py_bin, backend_cfg.package)
+    local install_script = backend_cfg.install_script(py_bin, env .. "/bin")
 
     ssh_runner.execute_remote_script(install_script, function(ok2, output, code2)
       if not ok2 then
         notify(
-          string.format("[installer] pip install %s failed: %s", backend_name, table.concat(output or {}, "\n")),
+          string.format(
+            "[installer] %s install via %s failed: %s",
+            backend_name,
+            backend_cfg.install_label or "installer",
+            table.concat(output or {}, "\n")
+          ),
           vim.log.levels.ERROR
         )
         cb(false, false)
         return
       end
 
-      notify(string.format("[installer] pip install output:\n%s", table.concat(output or {}, "\n")), vim.log.levels.INFO, quiet)
+      notify(
+        string.format("[installer] install output (%s):\n%s", backend_cfg.install_label or "installer", table.concat(output or {}, "\n")),
+        vim.log.levels.INFO,
+        quiet
+      )
 
       run_check_async(function(ok3, out3, code3)
         if not ok3 then
@@ -514,9 +569,111 @@ function M.ensure_env_and_pyright_async(cb, opts)
     return
   end
 
+  local function prune_invalid_current_env(next_cb)
+    local current_env = config.get("env")
+    if not current_env or current_env == "" then
+      if next_cb then
+        next_cb()
+      end
+      return
+    end
+
+    state.get_validated_envs_async(host, function(valid_envs)
+      local normalized = require("oil_pyright_remote.path").normalize_env(current_env)
+      if normalized and not vim.tbl_contains(valid_envs, normalized) then
+        state.forget_env(host, normalized)
+        if config.get("env") == current_env then
+          config.set({ env = "" })
+        end
+      end
+      if next_cb then
+        next_cb()
+      end
+    end, { force = true, timeout = 15000 })
+  end
+
   local function continue_with_py(py_bin)
     local function handle_missing_py()
-      if not prompt_allowed then
+      prune_invalid_current_env(function()
+        if not prompt_allowed then
+          notify(
+            string.format(
+              "[installer] remote python unavailable; skipping start. host=%s path=%s",
+              host,
+              py_bin
+            ),
+            vim.log.levels.ERROR
+          )
+          local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
+          state.set_checked_env(cache_key)
+          cb(false)
+          return
+        end
+
+        local ok_input, retry = pcall(
+          vim.fn.input,
+          string.format(
+            "Remote python missing or not executable (host=%s code=%d): %s\nOutput:\n%s\nRe-enter remote python path (leave empty to keep current): ",
+            host,
+            state.get_last_check_out() and 2 or -1,
+            py_bin,
+            table.concat(state.get_last_check_out() or {}, "\n")
+          )
+        )
+
+        if not ok_input then
+          notify(
+            "[installer] prompt unavailable; set :PyrightRemoteEnv /path/to/venv (or g:pyright_remote_env) and retry",
+            vim.log.levels.WARN
+          )
+          local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
+          state.set_checked_env(cache_key)
+          cb(false)
+          return
+        end
+
+        retry = vim.fn.trim(retry or "")
+        if retry ~= "" then
+          py_bin = retry
+          local path = require("oil_pyright_remote.path")
+          local env_dir = path.normalize_env(retry)
+          config.set({ env = env_dir })
+          py_bin = env_dir and (env_dir .. "/bin/python") or retry
+
+          -- 递归检查新的路径
+          ssh_runner.python_exists_async(py_bin, function(ok_py2)
+            if not ok_py2 then
+              notify(
+                string.format(
+                  "[installer] remote python unavailable; skipping start. host=%s path=%s",
+                  host,
+                  py_bin
+                ),
+                vim.log.levels.ERROR
+              )
+              local cache_key = string.format("%s|%s|%s:missing", backend, host, config.get("env") or "")
+              state.set_checked_env(cache_key)
+              cb(false)
+              return
+            end
+
+            M.ensure_lsp_installed_async(py_bin, function(ok4, declined4)
+              local cache_key = string.format("%s|%s|%s", backend, host, config.get("env") or "")
+              if ok4 then
+                state.set_checked_env(cache_key)
+                state.mark_valid_env(backend .. ":" .. host, config.get("env"))
+                cb(true)
+              else
+                if declined4 then
+                  state.set_checked_env(cache_key .. ":missing")
+                end
+                cb(false)
+              end
+            end, opts)
+          end)
+          return
+        end
+
         notify(
           string.format(
             "[installer] remote python unavailable; skipping start. host=%s path=%s",
@@ -528,84 +685,7 @@ function M.ensure_env_and_pyright_async(cb, opts)
         local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
         state.set_checked_env(cache_key)
         cb(false)
-        return
-      end
-
-      local ok_input, retry = pcall(
-        vim.fn.input,
-        string.format(
-          "Remote python missing or not executable (host=%s code=%d): %s\nOutput:\n%s\nRe-enter remote python path (leave empty to keep current): ",
-          host,
-          state.get_last_check_out() and 2 or -1,
-          py_bin,
-          table.concat(state.get_last_check_out() or {}, "\n")
-        )
-      )
-
-      if not ok_input then
-        notify(
-          "[installer] prompt unavailable; set :PyrightRemoteEnv /path/to/venv (or g:pyright_remote_env) and retry",
-          vim.log.levels.WARN
-        )
-        local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
-        state.set_checked_env(cache_key)
-        cb(false)
-        return
-      end
-
-      retry = vim.fn.trim(retry or "")
-      if retry ~= "" then
-        py_bin = retry
-        local path = require("oil_pyright_remote.path")
-        local env_dir = path.normalize_env(retry)
-        config.set({ env = env_dir })
-        py_bin = env_dir and (env_dir .. "/bin/python") or retry
-
-        -- 递归检查新的路径
-        ssh_runner.python_exists_async(py_bin, function(ok_py2)
-          if not ok_py2 then
-            notify(
-              string.format(
-                "[installer] remote python unavailable; skipping start. host=%s path=%s",
-                host,
-                py_bin
-              ),
-              vim.log.levels.ERROR
-            )
-            local cache_key = string.format("%s|%s|%s:missing", backend, host, config.get("env") or "")
-            state.set_checked_env(cache_key)
-            cb(false)
-            return
-          end
-
-          M.ensure_lsp_installed_async(py_bin, function(ok4, declined4)
-            local cache_key = string.format("%s|%s|%s", backend, host, config.get("env") or "")
-            if ok4 then
-              state.set_checked_env(cache_key)
-              state.mark_valid_env(backend .. ":" .. host, config.get("env"))
-              cb(true)
-            else
-              if declined4 then
-                state.set_checked_env(cache_key .. ":missing")
-              end
-              cb(false)
-            end
-          end, opts)
-        end)
-        return
-      end
-
-      notify(
-        string.format(
-          "[installer] remote python unavailable; skipping start. host=%s path=%s",
-          host,
-          py_bin
-        ),
-        vim.log.levels.ERROR
-      )
-      local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
-      state.set_checked_env(cache_key)
-      cb(false)
+      end)
     end
 
     ssh_runner.python_exists_async(py_bin, function(ok_py, out_py, code_py)

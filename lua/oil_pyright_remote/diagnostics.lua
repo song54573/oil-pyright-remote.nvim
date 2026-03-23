@@ -322,6 +322,14 @@ function M.cleanup_client(client_id)
   end
 end
 
+function M.cleanup()
+  for client_id, _ in pairs(diagnostic_ns_by_client) do
+    M.cleanup_client(client_id)
+  end
+  diagnostic_namespaces = {}
+  diagnostic_ns_by_client = {}
+end
+
 -----------------------------------------------------------------------
 -- M.get_diagnostics(bufnr)
 -- 功能：获取缓冲区的诊断信息

@@ -15,6 +15,9 @@ local internal_state = {
   env_store = {},
   valid_store_loaded = false,
   valid_store = {},
+  env_validation_cache = {},
+  env_validation_pending = {},
+  env_list_cache = {},
 
   -- 全局标记
   prompted_env = false,
@@ -54,6 +57,263 @@ end
 -- 文件路径配置
 local env_store_path = vim.fn.stdpath("data") .. "/pyright_remote_envs.json"
 local valid_store_path = vim.fn.stdpath("data") .. "/pyright_remote_validated.json"
+local ENV_VALIDATION_TTL_MS = 30000
+
+local function now_ms()
+  if uv and type(uv.now) == "function" then
+    return uv.now()
+  end
+  return math.floor((vim.loop.hrtime() or 0) / 1000000)
+end
+
+local function shell_quote(str)
+  return "'" .. tostring(str or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function list_copy(items)
+  return vim.deepcopy(items or {})
+end
+
+local function unique_normalized_envs(envs)
+  local seen = {}
+  local result = {}
+
+  for _, env in ipairs(envs or {}) do
+    local normalized = path.normalize_env(env)
+    if normalized and normalized ~= "" and not seen[normalized] then
+      seen[normalized] = true
+      table.insert(result, normalized)
+    end
+  end
+
+  return result
+end
+
+local function invalidate_env_list_cache(host)
+  if not host or host == "" then
+    return
+  end
+  internal_state.env_list_cache[host] = nil
+end
+
+local function clear_env_validation_cache_for_host(host)
+  if not host or host == "" then
+    return
+  end
+
+  for key, _ in pairs(internal_state.env_validation_cache) do
+    if key:match("^" .. vim.pesc(host) .. "\n") then
+      internal_state.env_validation_cache[key] = nil
+    end
+  end
+end
+
+local function set_env_validation_cache(host, env, valid)
+  if not host or host == "" or not env or env == "" then
+    return
+  end
+
+  internal_state.env_validation_cache[table.concat({ host, env }, "\n")] = {
+    valid = valid == true,
+    expires_at = now_ms() + ENV_VALIDATION_TTL_MS,
+  }
+end
+
+local function get_env_validation_cache(host, env)
+  if not host or host == "" or not env or env == "" then
+    return nil
+  end
+
+  local entry = internal_state.env_validation_cache[table.concat({ host, env }, "\n")]
+  if not entry then
+    return nil
+  end
+  if entry.expires_at and entry.expires_at < now_ms() then
+    internal_state.env_validation_cache[table.concat({ host, env }, "\n")] = nil
+    return nil
+  end
+  return entry.valid
+end
+
+local function set_env_list_cache(host, envs)
+  if not host or host == "" then
+    return
+  end
+
+  internal_state.env_list_cache[host] = {
+    envs = list_copy(envs),
+    expires_at = now_ms() + ENV_VALIDATION_TTL_MS,
+  }
+end
+
+local function get_env_list_cache(host)
+  if not host or host == "" then
+    return nil
+  end
+
+  local entry = internal_state.env_list_cache[host]
+  if not entry then
+    return nil
+  end
+  if entry.expires_at and entry.expires_at < now_ms() then
+    internal_state.env_list_cache[host] = nil
+    return nil
+  end
+  return list_copy(entry.envs)
+end
+
+local function purge_valid_env_entries(vstore, host, env)
+  if type(vstore) ~= "table" or not host or host == "" or not env or env == "" then
+    return false
+  end
+
+  local changed = false
+  for key, envs in pairs(vstore) do
+    if key == host or key:match(":" .. vim.pesc(host) .. "$") then
+      if type(envs) == "table" and envs[env] ~= nil then
+        envs[env] = nil
+        changed = true
+      end
+      if type(envs) == "table" and vim.tbl_isempty(envs) then
+        vstore[key] = nil
+        changed = true
+      end
+    end
+  end
+
+  return changed
+end
+
+local function apply_validated_envs_for_host(host, valid_envs)
+  if not host or host == "" then
+    return {}
+  end
+
+  valid_envs = unique_normalized_envs(valid_envs)
+
+  local store = M.load_env_store()
+  local entry = store[host]
+  local old_envs = entry and entry.envs or {}
+  local old_last = entry and entry.last_env or nil
+  local env_changed = false
+
+  if entry then
+    if not vim.deep_equal(old_envs, valid_envs) then
+      entry.envs = valid_envs
+      env_changed = true
+    end
+
+    if old_last and not vim.tbl_contains(valid_envs, path.normalize_env(old_last)) then
+      entry.last_env = valid_envs[1] or nil
+      env_changed = true
+    elseif (not old_last or old_last == "") and valid_envs[1] then
+      entry.last_env = valid_envs[1]
+      env_changed = true
+    end
+
+    if #valid_envs == 0 and not entry.last_env then
+      store[host] = nil
+      env_changed = true
+    end
+  elseif #valid_envs > 0 then
+    store[host] = {
+      envs = valid_envs,
+      last_env = valid_envs[1],
+    }
+    env_changed = true
+  end
+
+  local valid_set = {}
+  for _, env in ipairs(valid_envs) do
+    valid_set[env] = true
+    set_env_validation_cache(host, env, true)
+  end
+
+  local vstore = M.load_valid_store()
+  local valid_changed = false
+  for _, env in ipairs(old_envs or {}) do
+    local normalized = path.normalize_env(env)
+    if normalized and not valid_set[normalized] then
+      set_env_validation_cache(host, normalized, false)
+      if purge_valid_env_entries(vstore, host, normalized) then
+        valid_changed = true
+      end
+    end
+  end
+
+  if env_changed then
+    M.save_env_store()
+  end
+  if valid_changed then
+    M.save_valid_store()
+  end
+
+  set_env_list_cache(host, valid_envs)
+  return valid_envs
+end
+
+local function prepare_host_envs(host)
+  if not host or host == "" then
+    return {}
+  end
+
+  local store = M.load_env_store()
+  local entry = store[host]
+  if not entry or type(entry.envs) ~= "table" then
+    return {}
+  end
+
+  local normalized = unique_normalized_envs(entry.envs)
+  local changed = not vim.deep_equal(normalized, entry.envs)
+
+  if entry.last_env and entry.last_env ~= "" then
+    local normalized_last = path.normalize_env(entry.last_env)
+    if normalized_last ~= entry.last_env then
+      entry.last_env = normalized_last
+      changed = true
+    end
+  end
+
+  if changed then
+    entry.envs = normalized
+    if #normalized == 0 and not entry.last_env then
+      store[host] = nil
+    end
+    M.save_env_store()
+  end
+
+  return normalized
+end
+
+local function build_env_validation_script(envs)
+  local lines = {
+    "check_env() {",
+    '  env_dir="$1"',
+    '  py="$env_dir/bin/python"',
+    '  if [ -x "$py" ] && "$py" -V >/dev/null 2>&1; then',
+    '    printf \'OK\\t%s\\n\' "$env_dir"',
+    "  fi",
+    "}",
+  }
+
+  for _, env in ipairs(envs or {}) do
+    table.insert(lines, "check_env " .. shell_quote(env))
+  end
+
+  return table.concat(lines, "\n")
+end
+
+local function parse_valid_env_lines(output)
+  local valid = {}
+  for _, line in ipairs(output or {}) do
+    local env = type(line) == "string" and line:match("^OK\t(.+)$") or nil
+    env = path.normalize_env(env)
+    if env and env ~= "" then
+      valid[env] = true
+    end
+  end
+  return valid
+end
 
 -----------------------------------------------------------------------
 -- 辅助函数：安全执行 JSON 操作
@@ -140,9 +400,158 @@ function M.list_envs(host)
   local config = require("oil_pyright_remote.config")
   local entry = store[host or config.get("host")]
   if entry and entry.envs then
-    return entry.envs
+    return list_copy(entry.envs)
   end
   return {}
+end
+
+-- M.get_validated_envs_async(host, cb, opts)
+-- 功能：校验指定 host 的环境历史，仅保留 python 可执行的环境
+-- 说明：
+--   - 成功校验后会永久删除无效项，并落盘更新 env_store/valid_store
+--   - SSH 失败/超时不会误删历史，只返回缓存或当前列表
+function M.get_validated_envs_async(host, cb, opts)
+  opts = opts or {}
+  if type(cb) ~= "function" then
+    error("get_validated_envs_async: cb 必须是函数")
+  end
+
+  local config = require("oil_pyright_remote.config")
+  host = host or config.get("host")
+  if not host or host == "" then
+    cb({})
+    return
+  end
+
+  if opts.force ~= true then
+    local cached = get_env_list_cache(host)
+    if cached then
+      cb(cached)
+      return
+    end
+  end
+
+  internal_state.env_validation_pending[host] = internal_state.env_validation_pending[host] or {}
+  table.insert(internal_state.env_validation_pending[host], cb)
+  if #internal_state.env_validation_pending[host] > 1 then
+    return
+  end
+
+  local envs = prepare_host_envs(host)
+  if #envs == 0 then
+    set_env_list_cache(host, {})
+    local pending = internal_state.env_validation_pending[host] or {}
+    internal_state.env_validation_pending[host] = nil
+    for _, waiter in ipairs(pending) do
+      pcall(waiter, {})
+    end
+    return
+  end
+
+  local cached_valids = {}
+  local uncached_envs = {}
+  for _, env in ipairs(envs) do
+    local cached = get_env_validation_cache(host, env)
+    if cached == true then
+      cached_valids[env] = true
+    elseif cached == nil or opts.force == true then
+      table.insert(uncached_envs, env)
+    end
+  end
+
+  local function finish(valid_set, persist)
+    valid_set = valid_set or {}
+    for env, ok in pairs(cached_valids) do
+      if ok then
+        valid_set[env] = true
+      end
+    end
+
+    local valid_envs = {}
+    for _, env in ipairs(envs) do
+      if valid_set[env] then
+        table.insert(valid_envs, env)
+      end
+    end
+
+    if persist then
+      valid_envs = apply_validated_envs_for_host(host, valid_envs)
+    else
+      set_env_list_cache(host, valid_envs)
+    end
+
+    local pending = internal_state.env_validation_pending[host] or {}
+    internal_state.env_validation_pending[host] = nil
+    for _, waiter in ipairs(pending) do
+      pcall(waiter, list_copy(valid_envs))
+    end
+  end
+
+  if #uncached_envs == 0 then
+    finish(vim.deepcopy(cached_valids), true)
+    return
+  end
+
+  local ssh_runner = require("oil_pyright_remote.ssh_runner")
+  local script = build_env_validation_script(uncached_envs)
+  local started = ssh_runner.execute_remote_script_on_host(host, script, function(ok, output)
+    if not ok then
+      local fallback = get_env_list_cache(host) or envs
+      local pending = internal_state.env_validation_pending[host] or {}
+      internal_state.env_validation_pending[host] = nil
+      for _, waiter in ipairs(pending) do
+        pcall(waiter, list_copy(fallback))
+      end
+      return
+    end
+
+    local valid_set = parse_valid_env_lines(output)
+    for _, env in ipairs(uncached_envs) do
+      set_env_validation_cache(host, env, valid_set[env] == true)
+    end
+    finish(valid_set, true)
+  end, {
+    timeout = opts.timeout or 15000,
+    quiet = true,
+    max_output_lines = math.max(32, #uncached_envs * 2),
+  })
+
+  if not started then
+    local fallback = get_env_list_cache(host) or envs
+    local pending = internal_state.env_validation_pending[host] or {}
+    internal_state.env_validation_pending[host] = nil
+    for _, waiter in ipairs(pending) do
+      pcall(waiter, list_copy(fallback))
+    end
+  end
+end
+
+-- M.get_validated_envs(host, opts)
+-- 功能：同步获取并清理指定 host 的有效环境列表
+function M.get_validated_envs(host, opts)
+  opts = opts or {}
+  local done = false
+  local result = {}
+  local timeout = opts.timeout or 15000
+
+  M.get_validated_envs_async(host, function(envs)
+    result = envs or {}
+    done = true
+  end, opts)
+
+  vim.wait(timeout + 100, function()
+    return done
+  end, 50, false)
+
+  if done then
+    return result
+  end
+
+  local cached = get_env_list_cache(host)
+  if cached then
+    return cached
+  end
+  return M.list_envs(host)
 end
 
 -- M.remember_env(host, env)
@@ -176,6 +585,8 @@ function M.remember_env(host, env)
 
   -- 添加到开头
   table.insert(entry.envs, 1, env)
+  invalidate_env_list_cache(host)
+  set_env_validation_cache(host, env, true)
   M.save_env_store()
 end
 
@@ -239,6 +650,7 @@ end
 function M.forget_env(host, env)
   local config = require("oil_pyright_remote.config")
   host = host or config.get("host")
+  env = path.normalize_env(env)
 
   if not host or host == "" then
     return
@@ -253,7 +665,14 @@ function M.forget_env(host, env)
     -- 清除整个主机记录
     store[host] = nil
     local vstore = M.load_valid_store()
-    vstore[host] = nil
+    purge_valid_env_entries(vstore, host, "__all__")
+    for key, _ in pairs(vstore) do
+      if key == host or key:match(":" .. vim.pesc(host) .. "$") then
+        vstore[key] = nil
+      end
+    end
+    clear_env_validation_cache_for_host(host)
+    invalidate_env_list_cache(host)
     M.save_valid_store()
     M.save_env_store()
     return
@@ -279,14 +698,12 @@ function M.forget_env(host, env)
   end
 
   local vstore = M.load_valid_store()
-  if vstore[host] then
-    vstore[host][env] = nil
-    if vim.tbl_isempty(vstore[host]) then
-      vstore[host] = nil
-    end
+  if purge_valid_env_entries(vstore, host, env) then
     M.save_valid_store()
   end
 
+  invalidate_env_list_cache(host)
+  set_env_validation_cache(host, env, false)
   M.save_env_store()
 end
 
@@ -534,6 +951,9 @@ function M.reset()
   internal_state.prompted_env = false
   internal_state.checked_env = nil
   internal_state.last_check_out = nil
+  internal_state.env_validation_cache = {}
+  internal_state.env_validation_pending = {}
+  internal_state.env_list_cache = {}
 
   -- 重置重连状态
   M.stop_reconnect_timer()
