@@ -767,18 +767,27 @@ local function clear_ready_buffers_for_client(client_id)
   end
 end
 
-local function handle_client_exit(code, signal, client_id)
+local function run_client_exit_cleanup(code, signal, client_id)
   diagnostics.cleanup_client(client_id)
   clear_ready_buffers_for_client(client_id)
 
-  vim.schedule(function()
-    local clients = M.get_clients({ name = NATIVE_CONFIG_NAME })
-    if not clients or #clients == 0 then
-      last_registered_runtime = nil
-    end
-  end)
+  local clients = M.get_clients({ name = NATIVE_CONFIG_NAME })
+  if not clients or #clients == 0 then
+    last_registered_runtime = nil
+  end
 
   state.pyright_on_exit(code, signal, client_id)
+end
+
+local function handle_client_exit(code, signal, client_id)
+  if vim.in_fast_event and vim.in_fast_event() then
+    vim.schedule(function()
+      run_client_exit_cleanup(code, signal, client_id)
+    end)
+    return
+  end
+
+  run_client_exit_cleanup(code, signal, client_id)
 end
 
 -----------------------------------------------------------------------

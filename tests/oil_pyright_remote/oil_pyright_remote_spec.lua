@@ -591,6 +591,82 @@ describe("oil_pyright_remote", function()
     assert.are.same({ 11, 9, 42 }, exit_args)
   end)
 
+  it("schedules client exit cleanup out of fast event context", function()
+    local config = require("oil_pyright_remote.config")
+    local lsp = require("oil_pyright_remote.lsp")
+    local diagnostics = require("oil_pyright_remote.diagnostics")
+    local state = require("oil_pyright_remote.state")
+    local original_cleanup_client = diagnostics.cleanup_client
+    local original_pyright_on_exit = state.pyright_on_exit
+    local original_in_fast_event = vim.in_fast_event
+    local original_schedule = vim.schedule
+    local original_get_client_by_id = vim.lsp.get_client_by_id
+    local original_buf_is_valid = vim.api.nvim_buf_is_valid
+    local cleanup_id = nil
+    local exit_args = nil
+    local scheduled = nil
+    local sync_phase = true
+
+    config.set({
+      host = "demo-host",
+      env = "/tmp/demo-env",
+    })
+
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(bufnr, "oil-ssh://demo-host//remote/project/exit-fast.py")
+    vim.bo[bufnr].filetype = "python"
+    lsp._compat.mark_buf_ready(bufnr)
+
+    diagnostics.cleanup_client = function(client_id)
+      cleanup_id = client_id
+    end
+    state.pyright_on_exit = function(code, signal, client_id)
+      exit_args = { code, signal, client_id }
+    end
+    vim.in_fast_event = function()
+      return true
+    end
+    vim.schedule = function(fn)
+      scheduled = fn
+    end
+    vim.lsp.get_client_by_id = function(client_id)
+      if client_id == 42 then
+        return {
+          id = client_id,
+          attached_buffers = {
+            [bufnr] = true,
+          },
+        }
+      end
+      return nil
+    end
+    vim.api.nvim_buf_is_valid = function(seen_bufnr)
+      if sync_phase then
+        error("nvim_buf_is_valid should not run during fast-event on_exit")
+      end
+      return original_buf_is_valid(seen_bufnr)
+    end
+
+    lsp._compat.handle_client_exit(11, 9, 42)
+
+    assert.are.equal(nil, cleanup_id)
+    assert.are.equal(nil, exit_args)
+    assert.are.equal("function", type(scheduled))
+
+    sync_phase = false
+    scheduled()
+
+    diagnostics.cleanup_client = original_cleanup_client
+    state.pyright_on_exit = original_pyright_on_exit
+    vim.in_fast_event = original_in_fast_event
+    vim.schedule = original_schedule
+    vim.lsp.get_client_by_id = original_get_client_by_id
+    vim.api.nvim_buf_is_valid = original_buf_is_valid
+
+    assert.are.equal(42, cleanup_id)
+    assert.are.same({ 11, 9, 42 }, exit_args)
+  end)
+
   it("installs ty via uv and bootstraps uv when missing", function()
     local config = require("oil_pyright_remote.config")
     config.set({
