@@ -40,6 +40,7 @@ end
 function M.prompt_env_path_async(cb, opts)
   opts = opts or {}
   local allow_prompt = opts.prompt ~= false
+  local ignore_current = opts.ignore_current == true
 
   if not allow_prompt then
     cb(nil)
@@ -47,11 +48,13 @@ function M.prompt_env_path_async(cb, opts)
   end
 
   local function ask_python()
-    local current_env = config.get("env")
+    local current_env = ignore_current and "" or config.get("env")
     local default_py = (current_env or "") .. "/bin/python"
     if default_py == "/bin/python" then
       default_py = ""
-      config.set({ env = "" })
+      if not ignore_current then
+        config.set({ env = "" })
+      end
     end
 
     local input = vim.fn.input(string.format("Remote python path (leave empty to keep current): [%s] ", default_py))
@@ -73,7 +76,7 @@ function M.prompt_env_path_async(cb, opts)
   end
 
   -- 检查是否有配置的环境
-  local current_env = config.get("env")
+  local current_env = ignore_current and "" or config.get("env")
   if not current_env or current_env == "" then
     local host = config.get("host")
     state.get_validated_envs_async(host, function(envs)
@@ -100,6 +103,62 @@ function M.prompt_env_path_async(cb, opts)
     -- 已有配置的环境，直接使用不阻塞UI
     cb(current_env .. "/bin/python")
   end
+end
+
+-----------------------------------------------------------------------
+-- M.choose_env_async(host, cb, opts)
+-- 功能：手动触发环境选择；先校验并清理历史，再让用户选择或输入
+-- 参数：
+--   host - 主机名，可选
+--   cb   - 回调函数 cb(selected_env)
+--   opts - 选项表：
+--          prompt: 是否允许用户输入，默认 true
+function M.choose_env_async(host, cb, opts)
+  opts = opts or {}
+  host = host or config.get("host")
+
+  if not host or host == "" then
+    cb(nil)
+    return
+  end
+
+  state.get_validated_envs_async(host, function(envs)
+    if envs and #envs > 0 then
+      M.select_env_async(host, function(choice)
+        if not choice or choice == "" then
+          cb(nil)
+          return
+        end
+
+        config.set({ env = choice })
+        state.remember_env(host, choice)
+        state.set_checked_env(nil)
+        cb(choice)
+      end, envs)
+      return
+    end
+
+    M.prompt_env_path_async(function(py_bin)
+      if not py_bin or py_bin == "" then
+        cb(nil)
+        return
+      end
+
+      local env = config.get("env")
+      if env and env ~= "" then
+        state.remember_env(host, env)
+      end
+      state.set_checked_env(nil)
+      cb(env)
+    end, {
+      prompt = opts.prompt,
+      ignore_current = true,
+      timeout = opts.timeout,
+    })
+  end, {
+    force = true,
+    timeout = opts.timeout or 15000,
+  })
 end
 
 -----------------------------------------------------------------------
@@ -560,150 +619,64 @@ function M.ensure_env_and_pyright_async(cb, opts)
     end
   end
 
-  -- 检查是否已经验证过此环境
   local env = config.get("env")
-  local backend = config.get("backend")
-  if env and state.has_valid_env(backend .. ":" .. host, env) then
-    state.set_prompted_env(true)
-    cb(true)
-    return
-  end
-
-  local function prune_invalid_current_env(next_cb)
-    local current_env = config.get("env")
-    if not current_env or current_env == "" then
-      if next_cb then
-        next_cb()
-      end
-      return
+  if not env or env == "" then
+    local last_env = state.get_last_env(host)
+    if last_env and last_env ~= "" then
+      config.set({ env = last_env })
+      env = last_env
     end
-
-    state.get_validated_envs_async(host, function(valid_envs)
-      local normalized = require("oil_pyright_remote.path").normalize_env(current_env)
-      if normalized and not vim.tbl_contains(valid_envs, normalized) then
-        state.forget_env(host, normalized)
-        if config.get("env") == current_env then
-          config.set({ env = "" })
-        end
-      end
-      if next_cb then
-        next_cb()
-      end
-    end, { force = true, timeout = 15000 })
   end
+
+  local backend = config.get("backend")
 
   local function continue_with_py(py_bin)
+    local function current_cache_key()
+      return string.format("%s|%s|%s", backend, host, config.get("env") or "")
+    end
+
     local function handle_missing_py()
-      prune_invalid_current_env(function()
-        if not prompt_allowed then
-          notify(
-            string.format(
-              "[installer] remote python unavailable; skipping start. host=%s path=%s",
-              host,
-              py_bin
-            ),
-            vim.log.levels.ERROR
-          )
-          local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
-          state.set_checked_env(cache_key)
-          cb(false)
-          return
-        end
-
-        local ok_input, retry = pcall(
-          vim.fn.input,
-          string.format(
-            "Remote python missing or not executable (host=%s code=%d): %s\nOutput:\n%s\nRe-enter remote python path (leave empty to keep current): ",
-            host,
-            state.get_last_check_out() and 2 or -1,
-            py_bin,
-            table.concat(state.get_last_check_out() or {}, "\n")
-          )
-        )
-
-        if not ok_input then
-          notify(
-            "[installer] prompt unavailable; set :PyrightRemoteEnv /path/to/venv (or g:pyright_remote_env) and retry",
-            vim.log.levels.WARN
-          )
-          local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
-          state.set_checked_env(cache_key)
-          cb(false)
-          return
-        end
-
-        retry = vim.fn.trim(retry or "")
-        if retry ~= "" then
-          py_bin = retry
-          local path = require("oil_pyright_remote.path")
-          local env_dir = path.normalize_env(retry)
-          config.set({ env = env_dir })
-          py_bin = env_dir and (env_dir .. "/bin/python") or retry
-
-          -- 递归检查新的路径
-          ssh_runner.python_exists_async(py_bin, function(ok_py2)
-            if not ok_py2 then
-              notify(
-                string.format(
-                  "[installer] remote python unavailable; skipping start. host=%s path=%s",
-                  host,
-                  py_bin
-                ),
-                vim.log.levels.ERROR
-              )
-              local cache_key = string.format("%s|%s|%s:missing", backend, host, config.get("env") or "")
-              state.set_checked_env(cache_key)
-              cb(false)
-              return
-            end
-
-            M.ensure_lsp_installed_async(py_bin, function(ok4, declined4)
-              local cache_key = string.format("%s|%s|%s", backend, host, config.get("env") or "")
-              if ok4 then
-                state.set_checked_env(cache_key)
-                state.mark_valid_env(backend .. ":" .. host, config.get("env"))
-                cb(true)
-              else
-                if declined4 then
-                  state.set_checked_env(cache_key .. ":missing")
-                end
-                cb(false)
-              end
-            end, opts)
-          end)
-          return
-        end
-
-        notify(
-          string.format(
-            "[installer] remote python unavailable; skipping start. host=%s path=%s",
-            host,
-            py_bin
-          ),
-          vim.log.levels.ERROR
-        )
-        local cache_key = string.format("%s|%s|%s:missing", backend, host, env or "")
-        state.set_checked_env(cache_key)
+      local cache_key = current_cache_key()
+      local invalid_key = cache_key .. ":invalid-notified"
+      if state.get_checked_env() == invalid_key then
         cb(false)
-      end)
+        return
+      end
+
+      notify(
+        string.format(
+          "[installer] remote python unavailable; skipping start. host=%s path=%s",
+          host,
+          py_bin
+        ),
+        vim.log.levels.ERROR
+      )
+      state.set_checked_env(invalid_key)
+      cb(false)
+    end
+
+    local cache_key = current_cache_key()
+    local checked_env = state.get_checked_env()
+
+    if checked_env == cache_key then
+      cb(true)
+      return
+    end
+    if checked_env == cache_key .. ":missing" or checked_env == cache_key .. ":invalid-notified" then
+      cb(false)
+      return
     end
 
     ssh_runner.python_exists_async(py_bin, function(ok_py, out_py, code_py)
       if not ok_py then
-        -- 调度到安全上下文执行用户交互
         vim.schedule(handle_missing_py)
         return
       end
 
-      local cache_key = string.format("%s|%s|%s", backend, host, config.get("env") or "")
-      local checked_env = state.get_checked_env()
-
-      if checked_env == cache_key then
+      if state.has_valid_env(backend .. ":" .. host, config.get("env")) then
+        state.set_checked_env(cache_key)
+        state.remember_env(host, config.get("env"))
         cb(true)
-        return
-      end
-      if checked_env == cache_key .. ":missing" then
-        cb(false)
         return
       end
 
@@ -725,7 +698,12 @@ function M.ensure_env_and_pyright_async(cb, opts)
     end)
   end
 
-  -- 检查是否已提示过环境
+  if env and env ~= "" then
+    state.set_prompted_env(true)
+    continue_with_py(env .. "/bin/python")
+    return
+  end
+
   if not state.get_prompted_env() then
     state.set_prompted_env(true)  -- 立即置位，防止重复触发
     M.prompt_env_path_async(function(py_bin)
@@ -735,11 +713,10 @@ function M.ensure_env_and_pyright_async(cb, opts)
       end
       continue_with_py(py_bin)
     end, { prompt = prompt_allowed })
-  else
-    local env = config.get("env")
-    local py_bin = env and (env .. "/bin/python") or "/bin/python"
-    continue_with_py(py_bin)
+    return
   end
+
+  cb(false)
 end
 
 -----------------------------------------------------------------------

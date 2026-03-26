@@ -10,6 +10,19 @@ describe("oil_pyright_remote", function()
     package.loaded["oil_pyright_remote.ui"] = nil
   end
 
+  local function reset_user_commands()
+    for _, name in ipairs({
+      "PyrightRemoteHost",
+      "PyrightRemoteEnv",
+      "PyrightRemoteRoot",
+      "PyrightRemoteRestart",
+      "PyrightRemoteEnvForget",
+      "PyrightRemoteStatus",
+    }) do
+      pcall(vim.api.nvim_del_user_command, name)
+    end
+  end
+
   before_each(function()
     vim.g.pyright_remote_host = nil
     vim.g.pyright_remote_env = nil
@@ -18,6 +31,7 @@ describe("oil_pyright_remote", function()
     vim.g.pyright_remote_auto_install = nil
     vim.g.pyright_remote_start_notify = nil
     vim.g.pyright_remote_auto_prompt = nil
+    reset_user_commands()
     reset_modules()
   end)
 
@@ -615,5 +629,157 @@ describe("oil_pyright_remote", function()
     assert.truthy(scripts[2]:match("pip install %-U uv"))
     assert.truthy(scripts[2]:match("uv pip install %-%-python"))
     assert.truthy(scripts[2]:match("%-%-upgrade ty"))
+  end)
+
+  it("restores last selected env without prompting when config env is empty", function()
+    local config = require("oil_pyright_remote.config")
+    local state = require("oil_pyright_remote.state")
+    local installer = require("oil_pyright_remote.installer")
+    local ssh_runner = require("oil_pyright_remote.ssh_runner")
+    local original_prompt_env_path_async = installer.prompt_env_path_async
+    local original_python_exists_async = ssh_runner.python_exists_async
+    local original_ensure_lsp_installed_async = installer.ensure_lsp_installed_async
+    local result = nil
+    local prompt_calls = 0
+    local seen_py = nil
+
+    config.set({
+      host = "demo-host",
+      env = "",
+    })
+    state.load_env_store()["demo-host"] = {
+      envs = { "/env/one", "/env/two" },
+      last_env = "/env/two",
+    }
+
+    installer.prompt_env_path_async = function()
+      prompt_calls = prompt_calls + 1
+    end
+    ssh_runner.python_exists_async = function(py_bin, cb)
+      seen_py = py_bin
+      cb(true, {}, 0)
+    end
+    installer.ensure_lsp_installed_async = function(py_bin, cb)
+      assert.are.equal("/env/two/bin/python", py_bin)
+      cb(true, false)
+    end
+
+    installer.ensure_env_and_pyright_async(function(ok)
+      result = ok
+    end, { quiet = true })
+
+    installer.prompt_env_path_async = original_prompt_env_path_async
+    ssh_runner.python_exists_async = original_python_exists_async
+    installer.ensure_lsp_installed_async = original_ensure_lsp_installed_async
+
+    assert.is_true(result)
+    assert.are.equal(0, prompt_calls)
+    assert.are.equal("/env/two/bin/python", seen_py)
+    assert.are.equal("/env/two", config.get("env"))
+    assert.are.equal("/env/two", state.get_last_env("demo-host"))
+  end)
+
+  it("notifies once and never reprompts when restored env python is missing", function()
+    local config = require("oil_pyright_remote.config")
+    local state = require("oil_pyright_remote.state")
+    local installer = require("oil_pyright_remote.installer")
+    local ssh_runner = require("oil_pyright_remote.ssh_runner")
+    local original_schedule = vim.schedule
+    local original_notify = vim.notify
+    local original_input = vim.fn.input
+    local original_prompt_env_path_async = installer.prompt_env_path_async
+    local original_python_exists_async = ssh_runner.python_exists_async
+    local original_get_validated_envs_async = state.get_validated_envs_async
+    local notify_calls = {}
+    local prompt_calls = 0
+    local input_calls = 0
+    local results = {}
+
+    config.set({
+      host = "demo-host",
+      env = "",
+    })
+    state.load_env_store()["demo-host"] = {
+      envs = { "/env/bad" },
+      last_env = "/env/bad",
+    }
+
+    vim.schedule = function(fn)
+      fn()
+    end
+    vim.notify = function(msg, level)
+      table.insert(notify_calls, { msg = msg, level = level })
+    end
+    vim.fn.input = function()
+      input_calls = input_calls + 1
+      return ""
+    end
+    installer.prompt_env_path_async = function()
+      prompt_calls = prompt_calls + 1
+    end
+    ssh_runner.python_exists_async = function(_, cb)
+      cb(false, { "missing" }, 2)
+    end
+    state.get_validated_envs_async = function(_, cb, _)
+      cb({})
+    end
+
+    installer.ensure_env_and_pyright_async(function(ok)
+      table.insert(results, ok)
+    end, { quiet = false })
+    installer.ensure_env_and_pyright_async(function(ok)
+      table.insert(results, ok)
+    end, { quiet = false })
+
+    vim.schedule = original_schedule
+    vim.notify = original_notify
+    vim.fn.input = original_input
+    installer.prompt_env_path_async = original_prompt_env_path_async
+    ssh_runner.python_exists_async = original_python_exists_async
+    state.get_validated_envs_async = original_get_validated_envs_async
+
+    assert.are.same({ false, false }, results)
+    assert.are.equal(1, #notify_calls)
+    assert.truthy(notify_calls[1].msg:match("remote python unavailable"))
+    assert.are.equal(0, prompt_calls)
+    assert.are.equal(0, input_calls)
+    assert.are.equal("/env/bad", config.get("env"))
+    assert.are.equal("/env/bad", state.get_last_env("demo-host"))
+  end)
+
+  it("PyrightRemoteEnv without args runs interactive env selection", function()
+    local config = require("oil_pyright_remote.config")
+    local ui = require("oil_pyright_remote.ui")
+    local installer = require("oil_pyright_remote.installer")
+    local original_choose_env_async = installer.choose_env_async
+    local called_host = nil
+    local restart_calls = 0
+
+    config.set({
+      host = "demo-host",
+      env = "/env/current",
+    })
+
+    installer.choose_env_async = function(host, cb)
+      called_host = host
+      cb("/env/next")
+    end
+
+    ui.create_user_commands({
+      maybe_restart = function()
+        restart_calls = restart_calls + 1
+      end,
+      list_envs = function()
+        return {}
+      end,
+    })
+
+    vim.cmd("PyrightRemoteEnv")
+
+    installer.choose_env_async = original_choose_env_async
+
+    assert.are.equal("demo-host", called_host)
+    assert.are.equal("/env/next", config.get("env"))
+    assert.are.equal(1, restart_calls)
   end)
 end)

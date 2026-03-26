@@ -7,6 +7,7 @@ local M = {}
 -- 依赖模块
 local config = require("oil_pyright_remote.config")
 local state = require("oil_pyright_remote.state")
+local installer = require("oil_pyright_remote.installer")
 
 -- 模块状态
 local initialized = false
@@ -40,10 +41,24 @@ function M.create_user_commands(deps)
   -- 环境配置命令
   vim.api.nvim_create_user_command("PyrightRemoteEnv", function(opts)
     if opts.args == "" then
-      vim.notify(string.format("[pyright_remote] current env: %s", config.get("env")), vim.log.levels.INFO)
+      installer.choose_env_async(config.get("host"), function(choice)
+        if not choice or choice == "" then
+          return
+        end
+
+        config.set({ env = choice })
+        state.remember_env(config.get("host"), config.get("env"))
+        state.set_checked_env(nil)
+        vim.notify(string.format("[pyright_remote] env -> %s", config.get("env")), vim.log.levels.INFO)
+        if deps.maybe_restart then
+          deps.maybe_restart()
+        end
+      end)
       return
     end
     config.set({ env = vim.fn.expand(opts.args) })
+    state.remember_env(config.get("host"), config.get("env"))
+    state.set_checked_env(nil)
     vim.notify(string.format("[pyright_remote] env -> %s", config.get("env")), vim.log.levels.INFO)
     if deps.maybe_restart then
       deps.maybe_restart()
