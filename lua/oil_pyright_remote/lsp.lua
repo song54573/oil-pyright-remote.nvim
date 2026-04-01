@@ -23,6 +23,7 @@ local remote_root_cache = {}
 local pending_root_probes = {}
 local runtime_cache = {}
 local root_correction_once = {}
+local stopping_clients = {}
 local last_registered_runtime = nil
 local cache_tick = 0
 
@@ -438,21 +439,43 @@ local function stop_lsp_client(target, force)
     client_id = target.id
   end
 
+  local stop_phase = client_id and stopping_clients[client_id] or nil
+  local is_stopped = type(client) == "table" and type(client.is_stopped) == "function" and client:is_stopped() or false
+  local is_stopping = type(client) == "table" and type(client.is_stopping) == "function" and client:is_stopping() or false
+
+  if is_stopped then
+    if client_id then
+      stopping_clients[client_id] = nil
+    end
+    return true, false
+  end
+
+  if force ~= true and (stop_phase ~= nil or is_stopping) then
+    return true, false
+  end
+  if force == true and stop_phase == "forced" then
+    return true, false
+  end
+
   if client and type(client.stop) == "function" then
     local ok = pcall(client.stop, client, force == true)
     if ok then
-      return true
+      if client_id then
+        stopping_clients[client_id] = force == true and "forced" or "graceful"
+      end
+      return true, true
     end
   end
 
   if client_id and type(vim.lsp.stop_client) == "function" then
     local ok = pcall(vim.lsp.stop_client, client_id, force == true)
     if ok then
-      return true
+      stopping_clients[client_id] = force == true and "forced" or "graceful"
+      return true, true
     end
   end
 
-  return false
+  return false, false
 end
 
 local function should_reuse_client(client, client_config)
@@ -461,6 +484,14 @@ local function should_reuse_client(client, client_config)
   end
 
   if client.name ~= client_config.name then
+    return false
+  end
+
+  if client.id and stopping_clients[client.id] ~= nil then
+    return false
+  end
+
+  if type(client.is_stopping) == "function" and client:is_stopping() then
     return false
   end
 
@@ -699,9 +730,13 @@ local function restart_for_root_correction(bufnr)
 
   local clients = M.get_clients({ name = NATIVE_CONFIG_NAME })
   if clients and #clients > 0 then
-    state.increment_suppress_count()
+    local initiated_stop = false
     for _, client in ipairs(clients) do
-      stop_lsp_client(client, false)
+      local _, initiated = stop_lsp_client(client, false)
+      initiated_stop = initiated_stop or initiated
+    end
+    if initiated_stop then
+      state.increment_suppress_count()
     end
   end
 
@@ -768,6 +803,9 @@ local function clear_ready_buffers_for_client(client_id)
 end
 
 local function run_client_exit_cleanup(code, signal, client_id)
+  if client_id then
+    stopping_clients[client_id] = nil
+  end
   diagnostics.cleanup_client(client_id)
   clear_ready_buffers_for_client(client_id)
 
@@ -1007,9 +1045,13 @@ function M.restart_client(bufnr)
   -- 停止现有客户端
   local clients = M.get_clients({ name = "pyright_remote" })
   if clients and #clients > 0 then
-    state.increment_suppress_count()
+    local initiated_stop = false
     for _, c in ipairs(clients) do
-      stop_lsp_client(c, false)
+      local _, initiated = stop_lsp_client(c, false)
+      initiated_stop = initiated_stop or initiated
+    end
+    if initiated_stop then
+      state.increment_suppress_count()
     end
   end
 
@@ -1107,6 +1149,7 @@ function M.cleanup()
   runtime_cache = {}
   root_correction_once = {}
   native_ready_buffers = {}
+  stopping_clients = {}
   last_registered_runtime = nil
   cache_tick = 0
 end

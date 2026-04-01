@@ -256,6 +256,78 @@ describe("oil_pyright_remote", function()
     assert.is_false(called_force)
   end)
 
+  it("does not reuse clients that are stopping on Neovim 0.12", function()
+    local lsp = require("oil_pyright_remote.lsp")
+
+    local reusable = lsp._compat.should_reuse_client({
+      id = 21,
+      name = "pyright_remote",
+      config = {
+        root_dir = "/remote/project",
+        _pyright_remote_host = "demo-host",
+      },
+      is_stopping = function()
+        return true
+      end,
+    }, {
+      name = "pyright_remote",
+      root_dir = "/remote/project",
+      _pyright_remote_host = "demo-host",
+    })
+
+    assert.is_false(reusable)
+  end)
+
+  it("does not stop client twice while shutdown is already in progress", function()
+    local lsp = require("oil_pyright_remote.lsp")
+    local stop_calls = 0
+    local client = {
+      id = 77,
+      stop = function()
+        stop_calls = stop_calls + 1
+      end,
+    }
+
+    local first = lsp._compat.stop_lsp_client(client, false)
+    local second = lsp._compat.stop_lsp_client(client, false)
+
+    assert.is_true(first)
+    assert.is_true(second)
+    assert.are.equal(1, stop_calls)
+  end)
+
+  it("restart_client does not increment suppress_count for clients already stopping", function()
+    local lsp = require("oil_pyright_remote.lsp")
+    local state = require("oil_pyright_remote.state")
+    local original_get_clients = lsp.get_clients
+    local original_enable_pyright_remote = lsp.enable_pyright_remote
+    local reconnect = state.get_reconnect_state()
+
+    reconnect.suppress_count = 0
+    lsp.get_clients = function()
+      return {
+        {
+          id = 88,
+          is_stopping = function()
+            return true
+          end,
+          stop = function()
+            error("stop should not be called for a stopping client")
+          end,
+        },
+      }
+    end
+    lsp.enable_pyright_remote = function()
+    end
+
+    lsp.restart_client(1)
+
+    lsp.get_clients = original_get_clients
+    lsp.enable_pyright_remote = original_enable_pyright_remote
+
+    assert.are.equal(0, reconnect.suppress_count)
+  end)
+
   it("registers and enables native config on Neovim 0.11+", function()
     with_stubbed_native_lsp(function(config_store, enabled)
       local lsp = require("oil_pyright_remote.lsp")
