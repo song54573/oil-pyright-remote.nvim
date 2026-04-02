@@ -17,7 +17,6 @@ local initialized = false
 local capabilities = nil
 local native_mode = false
 local native_config_registered = false
-local native_config_enabled = false
 local native_ready_buffers = {}
 local remote_root_cache = {}
 local pending_root_probes = {}
@@ -1131,18 +1130,6 @@ local function register_native_config()
   native_config_registered = true
 end
 
-local function enable_native_config()
-  if not native_mode or native_config_enabled then
-    return
-  end
-
-  local already_enabled = type(vim.lsp.is_enabled) == "function" and vim.lsp.is_enabled(NATIVE_CONFIG_NAME)
-  if not already_enabled then
-    vim.lsp.enable(NATIVE_CONFIG_NAME)
-  end
-  native_config_enabled = true
-end
-
 function M.cleanup()
   remote_root_cache = {}
   pending_root_probes = {}
@@ -1207,7 +1194,6 @@ function M.setup(capabilities_override)
 
   if native_mode then
     register_native_config()
-    enable_native_config()
   end
 
   initialized = true
@@ -1429,7 +1415,6 @@ M._compat = {
   clear_buf_ready = clear_buf_ready,
   refresh_native_registered_config = refresh_native_registered_config,
   register_native_config = register_native_config,
-  enable_native_config = enable_native_config,
   stop_lsp_client = stop_lsp_client,
   should_reuse_client = should_reuse_client,
   cleanup = M.cleanup,

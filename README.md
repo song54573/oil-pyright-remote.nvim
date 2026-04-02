@@ -34,6 +34,11 @@ The plugin may restart the remote client internally during root correction or
 reconnect handling. You do not need to run `:PyrightRemoteRestart` manually for
 client stop/start transitions to happen.
 
+The plugin does not call `vim.lsp.enable('pyright_remote')` internally. Native
+configs are registered for compatibility with Neovim's 0.11/0.12 LSP APIs,
+while actual remote client lifecycle remains plugin-managed so SSH preflight
+checks stay in front of startup.
+
 ### Remote prerequisites
 - SSH access to the target host (key or agent recommended).
 - A Python virtualenv on the remote host; pyright or ty will be installed on demand if missing (see `g:pyright_remote_auto_install`).
